@@ -11,6 +11,7 @@ Key Features
 - Cross-Platform: Built with Rust for a fast, native experience on both Windows and Linux.
 
 Installation (Download)
+
 You can find the latest version for Windows and Linux in the [Releases](https://github.com/fangyq09/VectorSnap/releases) section.
 1. Go to the Releases page.
 2. Download the appropriate binary for your system.
