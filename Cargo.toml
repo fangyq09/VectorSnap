@@ -1,0 +1,26 @@
+[package]
+name = "VectorSnap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+#eframe = { version = "0.33", features = ["default", "persistence"] }
+eframe = "0.33"
+egui = "0.33"
+pdfium-render = { version = "0.8.26", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.15"
+chrono = "0.4"
+arboard = "3.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+printpdf = "0.7"
+mimalloc = "0.1"
+
+[profile.release]
+opt-level = 3        # 最高级优化
+lto = "fat"          # 开启全代码增量优化 (Link Time Optimization)
+codegen-units = 1    # 牺牲编译速度换取更好的全局优化
+panic = "abort"      # 移除 panic 栈回溯信息，减小体积并提升性能
+strip = true         # 移除符号表，进一步压缩体积
