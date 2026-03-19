@@ -41,6 +41,7 @@ struct CachedLink {
 struct PdfApp {
     //pdfium: Pdfium,
 		pdfium: &'static Pdfium,
+		last_applied_title: String,
     pdf_doc: Option<PdfDocument<'static>>,
     current_page: usize,
     texture: Option<egui::TextureHandle>,
@@ -173,6 +174,7 @@ impl PdfApp {
 
 		let mut app = Self {
 			pdfium,
+			last_applied_title: "VectorSnap".to_string(),
 			pdf_doc: None,
 			current_page: 0,
 			texture: None,
@@ -235,8 +237,11 @@ impl eframe::App for PdfApp {
 	fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 
 		// 发送命令给窗口管理器更新标题
-		let title = self.pdf_name.as_deref().unwrap_or("VectorSnap").to_string();
-		ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+		let current_title = self.pdf_name.as_deref().unwrap_or("VectorSnap").to_string();
+		if self.last_applied_title != current_title {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(current_title.clone()));
+        self.last_applied_title = current_title;
+    }
 
 		// --- 0. 快捷键监听 (放在所有 UI 渲染之前) ---
 		self.handle_shortcuts(ctx);
