@@ -1,10 +1,9 @@
 [package]
 name = "VectorSnap"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
-#eframe = { version = "0.33", features = ["default", "persistence"] }
 eframe = "0.33"
 egui = "0.33"
 pdfium-render = { version = "0.8.26", features = ["image"] }
@@ -17,6 +16,13 @@ serde_json = "1"
 dirs = "5"
 printpdf = "0.7"
 mimalloc = "0.1"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+base64 = "0.21"
+notify = "6.1.1"
+
+
+[patch.crates-io]
+egui = { git = "https://github.com/fangyq09/egui-0.33.3-patch.git" }
 
 [profile.release]
 opt-level = 3        # 最高级优化
