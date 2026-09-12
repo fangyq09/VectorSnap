@@ -24,6 +24,9 @@ notify = "6.1.1"
 [patch.crates-io]
 egui = { git = "https://github.com/fangyq09/egui-0.33.3-patch.git" }
 
+[build-dependencies]
+winresource = "0.1"
+
 [profile.release]
 opt-level = 3        # 最高级优化
 lto = "fat"          # 开启全代码增量优化 (Link Time Optimization)
