@@ -177,6 +177,7 @@ struct PdfApp {
 		last_opened_dir: Option<std::path::PathBuf>,
 		drag_start_local: Option<egui::Pos2>,     
     selection_rect_local: Option<egui::Rect>,
+		last_selection_rect: Option<egui::Rect>,
 		//favorite_files: Vec<PathBuf>,
 		//favorite_folders: Vec<PathBuf>,
 		//show_full_path: bool,
@@ -226,6 +227,7 @@ struct PdfApp {
 		annotations: std::collections::BTreeMap<usize, Vec<Annotation>>,
 		last_pressure: f32,
 		last_time_stamp: f32,
+		//extracted_text_cache: Option<String>,
 }
 
 fn load_config() -> AppConfig {
@@ -369,6 +371,7 @@ impl PdfApp {
 			last_opened_dir: None,
 			drag_start_local: None,
 			selection_rect_local: None,
+			last_selection_rect: None,
 			//favorite_files: config.favorite_files.clone(),
 			//favorite_folders: config.favorite_folders.clone(),
 			//show_full_path: config.show_full_path.clone(),
@@ -423,6 +426,7 @@ impl PdfApp {
 			annotations: std::collections::BTreeMap::new(),
 			last_pressure: 0.0,
 			last_time_stamp: 0.0,
+			//extracted_text_cache: None,
 		};
 
 		// 如果启动参数里有路径，直接调用加载函数
@@ -858,20 +862,42 @@ impl PdfApp {
 						}
 
 						// --- 2. 页码显示 ---
-						//ui.label(format!("Page {} of {}", self.current_page + 1, total));
-						let mut display_page = self.current_page + 1;
-
+						//let mut page_str = (self.current_page + 1).to_string();
+						//let res = ui.add(
+						//	egui::TextEdit::singleline(&mut page_str)
+						//		.id(ui.id().with("page_text"))
+						//	.desired_width(35.0) // 限制宽度，防止输入框过长
+						//);
+						//if res.changed() {
+						//	// 尝试解析用户输入的数字，并限制在 1..=total 范围内
+						//	if let Ok(parsed_page) = page_str.parse::<usize>() {
+						//		let bounded_page = parsed_page.clamp(1, total);
+						//		self.current_page = bounded_page.saturating_sub(1);
+						//		self.texture = None; // 触发重新渲染
+						//	}
+						//}
+						let mut page_str = ui.data_mut(|d| {
+							d.get_temp::<String>(ui.id().with("page_input"))
+								.unwrap_or_else(|| (self.current_page + 1).to_string())
+						});
+						if !ui.memory(|mem| mem.has_focus(ui.id().with("page_text"))) {
+							page_str = (self.current_page + 1).to_string();
+						}
 						ui.label("Page");
 						let res = ui.add(
-							egui::DragValue::new(&mut display_page)
-							.range(1..=total)     // 限制输入范围
-							.speed(0.1)           // 拖拽时的感应速度
+							egui::TextEdit::singleline(&mut page_str)
+							.id(ui.id().with("page_text"))
+							.desired_width(30.0) 
 						);
 						ui.label(format!("of {}", total));
-
-						// 如果用户输入了新数字并按回车，或者拖动了数字
 						if res.changed() {
-							self.current_page = display_page.saturating_sub(1);
+							page_str.retain(|c| c.is_ascii_digit());
+							ui.data_mut(|d| d.insert_temp(ui.id().with("page_input"), page_str.clone()));
+						}
+						if res.lost_focus() {
+							let parsed_page = page_str.parse::<usize>().unwrap_or(self.current_page + 1);
+							let bounded_page = parsed_page.clamp(1, total);
+							self.current_page = bounded_page.saturating_sub(1);
 							self.texture = None; // 触发重新渲染
 						}
 
@@ -916,7 +942,7 @@ impl PdfApp {
 								if ui.selectable_label(self.tool_mode == ToolMode::Eraser, "Eraser").clicked() {
 									self.tool_mode = ToolMode::Eraser;
 								}
-								ui.menu_button("Colors", |ui| {
+								ui.menu_button("Settings", |ui| {
 									ui.group(|ui| {
 										ui.label("✏ Pen");
 										ui.horizontal(|ui| {
@@ -1308,15 +1334,18 @@ impl PdfApp {
 			ui.heading("Favorites");
 			ui.add_space(20.0);
 			// --- 切换开关 ---
+			let target_value = !self.config.show_full_path;
 			let toggle_label = if self.config.show_full_path { 
 				"Display Mode: Full Path" 
 			} else { 
 				"Display Mode: File Name Only"
 			};
-			if ui.button(toggle_label).on_hover_text("Click to toggle between full file path and name only")
-				.clicked() {
-				self.config.show_full_path = !self.config.show_full_path;
-				self.save_all_config(); // 状态改变后立即保存
+
+			// 参数：可变引用, 选中时赋予的值, 文本标签
+			if ui.selectable_value(&mut self.config.show_full_path, target_value, toggle_label)
+				.on_hover_text("Click to toggle display mode").changed() 
+			{
+				self.save_all_config();
 			}
 			ui.add_space(10.0);
 			// ----------------------
@@ -1327,6 +1356,7 @@ impl PdfApp {
 				.show(ui, |ui| {
 					// Ensure buttons stay centered inside the scroll area
 					ui.vertical_centered(|ui| {
+						let total_files = self.config.favorite_files.len();
 						for (idx, path) in self.config.favorite_files.iter().enumerate() {
 							let label = if self.config.show_full_path {
 								path.display().to_string()
@@ -1346,14 +1376,36 @@ impl PdfApp {
 
 							response.context_menu(|ui| {
 								// 移动功能
-								if idx > 0 && ui.button("⬆ Move Up").clicked() {
-									move_file = Some((idx, -1));
-									ui.close_kind(egui::UiKind::Menu);
+								//if idx > 0 && ui.button("⬆ Move Up").clicked() {
+								//	move_file = Some((idx, -1));
+								//	ui.close_kind(egui::UiKind::Menu);
+								//}
+								//if idx < self.config.favorite_files.len() - 1 && ui.button("⬇ Move Down").clicked() {
+								//	move_file = Some((idx, 1));
+								//	ui.close_kind(egui::UiKind::Menu);
+								//}
+								if idx > 0 {
+									if ui.button("⏫ Move to Top").clicked() {
+										move_file = Some((idx, -2));
+										ui.close_kind(egui::UiKind::Menu);
+									}
+									if ui.button("⬆ Move Up").clicked() {
+										move_file = Some((idx, -1));
+										ui.close_kind(egui::UiKind::Menu);
+									}
 								}
-								if idx < self.config.favorite_files.len() - 1 && ui.button("⬇ Move Down").clicked() {
-									move_file = Some((idx, 1));
-									ui.close_kind(egui::UiKind::Menu);
+								if idx < total_files - 1 {
+									if ui.button("⬇ Move Down").clicked() {
+										move_file = Some((idx, 1));
+										ui.close_kind(egui::UiKind::Menu);
+									}
+									if ui.button("⏬ Move to Bottom").clicked() {
+										move_file = Some((idx, 2));
+										ui.close_kind(egui::UiKind::Menu);
+									}
 								}
+
+								ui.separator();
 
 								if ui.button("🔍 Open another PDF from the Folder").clicked() {
 									let folder = path.parent().unwrap_or(std::path::Path::new("."));
@@ -1412,6 +1464,7 @@ impl PdfApp {
 				.auto_shrink([false, true]) 
 				.show(ui, |ui| {
 					ui.vertical_centered(|ui| {
+						let total_folders = self.config.favorite_folders.len();
 						for (idx, path) in self.config.favorite_folders.iter().enumerate() {
 								let label = format!("📁 {}", path.display());
 								let response = ui.button(label);
@@ -1427,14 +1480,36 @@ impl PdfApp {
 								}
 
 								response.context_menu(|ui| {
-									if idx > 0 && ui.button("⬆ Move Up").clicked() {
-										move_folder = Some((idx, -1));
-										ui.close_kind(egui::UiKind::Menu);
+									//if idx > 0 && ui.button("⬆ Move Up").clicked() {
+									//	move_folder = Some((idx, -1));
+									//	ui.close_kind(egui::UiKind::Menu);
+									//}
+									//if idx < self.config.favorite_folders.len() - 1 && ui.button("⬇ Move Down").clicked() {
+									//	move_folder = Some((idx, 1));
+									//	ui.close_kind(egui::UiKind::Menu);
+									//}
+									if idx > 0 {
+										if ui.button("⏫Move to Top").clicked() {
+											move_folder = Some((idx, -2));
+											ui.close_kind(egui::UiKind::Menu);
+										}
+										if ui.button("⬆ Move Up").clicked() {
+											move_folder = Some((idx, -1));
+											ui.close_kind(egui::UiKind::Menu);
+										}
 									}
-									if idx < self.config.favorite_folders.len() - 1 && ui.button("⬇ Move Down").clicked() {
-										move_folder = Some((idx, 1));
-										ui.close_kind(egui::UiKind::Menu);
+									if idx < total_folders - 1 {
+										if ui.button("⬇ Move Down").clicked() {
+											move_folder = Some((idx, 1));
+											ui.close_kind(egui::UiKind::Menu);
+										}
+										if ui.button("⏬Move to Bottom").clicked() {
+											move_folder = Some((idx, 2));
+											ui.close_kind(egui::UiKind::Menu);
+										}
 									}
+
+									ui.separator();
 									if ui.button("🗑 Remove Folder").clicked() {
 										folder_to_remove = Some(idx);
 										ui.close_kind(egui::UiKind::Menu);
@@ -1467,8 +1542,21 @@ impl PdfApp {
             self.save_all_config();
         }
         if let Some((idx, dir)) = move_file {
-            let target = if dir == -1 { idx - 1 } else { idx + 1 };
-            self.config.favorite_files.swap(idx, target);
+            //let target = if dir == -1 { idx - 1 } else { idx + 1 };
+            //self.config.favorite_files.swap(idx, target);
+					match dir {
+						-2 => { // 置顶：移到索引 0
+							let item = self.config.favorite_files.remove(idx);
+							self.config.favorite_files.insert(0, item);
+						}
+						2 => { // 置底：移到最后
+							let item = self.config.favorite_files.remove(idx);
+							self.config.favorite_files.push(item);
+						}
+						-1 => self.config.favorite_files.swap(idx, idx - 1), // 正常上移
+						1 => self.config.favorite_files.swap(idx, idx + 1),  // 正常下移
+						_ => {}
+						}
             self.save_all_config();
         }
 
@@ -1478,8 +1566,21 @@ impl PdfApp {
             self.save_all_config();
         }
         if let Some((idx, dir)) = move_folder {
-            let target = if dir == -1 { idx - 1 } else { idx + 1 };
-            self.config.favorite_folders.swap(idx, target);
+            //let target = if dir == -1 { idx - 1 } else { idx + 1 };
+            //self.config.favorite_folders.swap(idx, target);
+					match dir {
+						-2 => { // 置顶
+							let item = self.config.favorite_folders.remove(idx);
+							self.config.favorite_folders.insert(0, item);
+						}
+						2 => { // 置底
+							let item = self.config.favorite_folders.remove(idx);
+							self.config.favorite_folders.push(item);
+						}
+						-1 => self.config.favorite_folders.swap(idx, idx - 1),
+						1 => self.config.favorite_folders.swap(idx, idx + 1),
+						_ => {}
+						}
             self.save_all_config();
         }
 	}
@@ -1517,14 +1618,14 @@ impl PdfApp {
 					self.current_pen_stroke.clear();
 					self.current_eraser_stroke.clear();
 
-					// 记忆新文件的文件夹
-					if let Some(parent) = path.parent() {
-						self.last_opened_dir = Some(parent.to_path_buf());
-					}
-					// 记忆文件名
-					if let Some(os_str) = path.file_stem() {
-						self.pdf_name = Some(os_str.to_string_lossy().to_string());
-					}
+					//// 记忆新文件的文件夹
+					//if let Some(parent) = path.parent() {
+					//	self.last_opened_dir = Some(parent.to_path_buf());
+					//}
+					//// 记忆文件名
+					//if let Some(os_str) = path.file_stem() {
+					//	self.pdf_name = Some(os_str.to_string_lossy().to_string());
+					//}
 
 					// 从历史记录恢复页码
 					self.current_page = *self.history.last_pages.get(&path_str).unwrap_or(&0);
@@ -1533,6 +1634,15 @@ impl PdfApp {
 					if let Ok(full_path) = path.canonicalize() {
 						self.setup_watcher(full_path);
 					}
+				}
+
+				// 记忆新文件的文件夹
+				if let Some(parent) = path.parent() {
+					self.last_opened_dir = Some(parent.to_path_buf());
+				}
+				// 记忆文件名
+				if let Some(os_str) = path.file_stem() {
+					self.pdf_name = Some(os_str.to_string_lossy().to_string());
 				}
 
 
@@ -2347,6 +2457,7 @@ fn handle_selection_interaction(
     // 4. 状态：释放鼠标（执行裁剪）
     if response.drag_stopped() {
         if let Some(local_rect) = self.selection_rect_local {
+						self.last_selection_rect = Some(local_rect);
 						// A. 先执行高分辨率裁剪
             self.perform_high_res_crop(ctx, page, local_rect, response.rect.size());
 						// B. 自动复制到剪贴板
@@ -2354,9 +2465,65 @@ fn handle_selection_interaction(
 						//if let Some(img) = &self.last_cropped_image {
 						//	copy_image_to_clipboard(img);
 						//}
-        }
-        // 重置状态
-        self.drag_start_local = None;
+						// C. 提取裁剪框内的文本，必要时可以在此时提取出来文本
+						//let actual_ui_size = response.rect.size();
+						//if let Ok(page_text) = page.text() {
+            //    let pdf_width_pts = page.width().value as f32;
+            //    let pdf_height_pts = page.height().value as f32;
+
+            //    // 1. 缩放比例
+            //    let scale_x = pdf_width_pts / actual_ui_size.x;
+            //    let scale_y = pdf_height_pts / actual_ui_size.y;
+
+            //    // 2. 换算 Egui 拉框到 PDF 物理坐标（镜像 Y 轴）
+            //    let pdf_min_x = local_rect.min.x * scale_x;
+            //    let pdf_max_x = local_rect.max.x * scale_x;
+            //    let pdf_min_y = pdf_height_pts - (local_rect.max.y * scale_y);
+            //    let pdf_max_y = pdf_height_pts - (local_rect.min.y * scale_y);
+
+            //    // 我们在 Y 轴和 X 轴加上正负 5.0 Points 的容错边界（允许字符部分擦边也被收纳进来）
+            //    let target_min_x = pdf_min_x - 5.0;
+            //    let target_max_x = pdf_max_x + 5.0;
+            //    let target_min_y = pdf_min_y - 5.0;
+            //    let target_max_y = pdf_max_y + 5.0;
+
+            //    let mut matched_chars = Vec::new();
+						//		let chars_list = page_text.chars();
+						//		let total_chars = chars_list.len();
+
+            //    // 3. 遍历全页所有的字符，只保留在我们选区范围内的字符
+						//		for i in 0..total_chars {
+            //        if let Ok(c) = chars_list.get(i) {
+            //            if let Ok(char_rect) = c.loose_bounds() {
+            //                let char_x = char_rect.left().value;
+            //                let char_y = char_rect.bottom().value;
+
+            //                // 判定坐标是否在选区内
+            //                if char_x >= target_min_x 
+            //                    && char_x <= target_max_x 
+            //                    && char_y >= target_min_y 
+            //                    && char_y <= target_max_y 
+            //                {
+						//										if let Some(ch) = c.unicode_char() {
+            //                        matched_chars.push(ch.to_string());
+            //                    }
+            //                }
+            //            }
+            //        }
+            //    }
+            //    // 4. 将匹配到的字符拼接起来
+            //    if !matched_chars.is_empty() {
+            //        let txt = matched_chars.concat();
+            //        self.extracted_text_cache = Some(txt);
+            //    } else {
+            //        self.extracted_text_cache = None;
+            //    }
+            //} else {
+            //    self.extracted_text_cache = None;
+            //}
+				}
+				// 重置状态
+				self.drag_start_local = None;
         self.selection_rect_local = None;
     }
 
@@ -2388,6 +2555,7 @@ impl PdfApp {
 		// 技巧：先把我们需要的数据“偷”出来，不要在 show 闭包里引用 self.cropped_tex
 		let mut should_close = false;
 		let mut should_copy = false;
+		let mut should_copy_text = false;
 		let mut save_format: Option<&str> = None;
 
 		// 只在这里获取一次纹理引用
@@ -2412,7 +2580,7 @@ impl PdfApp {
 
 					ui.add_space(5.0);
 					ui.horizontal(|ui| {
-						ui.columns(4, |cols| {
+						ui.columns(5, |cols| {
 							// 第一列：Discard
 							cols[0].vertical_centered(|ui| {
 								if ui.button(egui::RichText::new("🗑 Discard").strong()).clicked() { 
@@ -2421,29 +2589,42 @@ impl PdfApp {
 							});
 							// 第二列：Copy
 							cols[1].vertical_centered(|ui| {
-								if ui.button(egui::RichText::new("📋 Copy").strong()).clicked() {
+								if ui.button(egui::RichText::new("📋 Copy Image").strong()).clicked() {
 									should_copy = true; 
 								}
 							});
-							
-							// 第三列：Save as (合并 PNG 和 JPG)
-							cols[2].vertical_centered(|ui| {
-								ui.menu_button(egui::RichText::new("Save as").strong(), |ui| {
-									ui.set_min_width(40.0);
-									if ui.button("PNG").clicked() {
-										save_format = Some("png");
-										ui.close_kind(egui::UiKind::Menu);
-									}
-									ui.separator();
-									if ui.button("JPG").clicked() {
-										save_format = Some("jpg");
-										ui.close_kind(egui::UiKind::Menu);
-									}
-								});
-							});
 
+							// 第三列：新增的 Copy Text 按钮
+							cols[2].vertical_centered(|ui| {
+								if ui.button(egui::RichText::new("Copy Text").strong()).clicked() {
+									should_copy_text = true;
+								}
+							});
+							
+							// 第四列：Save as (合并 PNG 和 JPG)
 							cols[3].vertical_centered(|ui| {
-								let btn = ui.button(egui::RichText::new("OCR").strong());
+								if ui.button(egui::RichText::new("Save as PNG").strong()).clicked() {
+										save_format = Some("png");
+								}
+							});
+							//cols[3].vertical_centered(|ui| {
+							//	ui.menu_button(egui::RichText::new("Save as").strong(), |ui| {
+							//		ui.set_min_width(40.0);
+							//		if ui.button("PNG").clicked() {
+							//			save_format = Some("png");
+							//			ui.close_kind(egui::UiKind::Menu);
+							//		}
+							//		ui.separator();
+							//		if ui.button("JPG").clicked() {
+							//			save_format = Some("jpg");
+							//			ui.close_kind(egui::UiKind::Menu);
+							//		}
+							//	});
+							//});
+
+							// 第五列：OCR 
+							cols[4].vertical_centered(|ui| {
+								let btn = ui.button(egui::RichText::new("OCR Text").strong());
 								if btn.clicked() {
 									self.current_latex = None; 
 									self.show_ocr_window = false;
@@ -2455,82 +2636,6 @@ impl PdfApp {
 								btn.on_hover_text("Click to get LaTeX Code");
 							});
 
-							//cols[4].vertical_centered(|ui| {
-							//	ui.menu_button(egui::RichText::new("More ▼").strong(), |ui| {
-							//		ui.set_min_width(120.0);
-
-							//		// --- 快捷翻译选项 ---
-							//		if ui.button("Translate to English").clicked() {
-							//			self.current_latex = None; 
-							//			self.show_ocr_window = false;
-							//			let image_to_send = self.last_ocr_image.as_ref().or(self.last_cropped_image.as_ref());
-							//			if let Some(img) = image_to_send {
-							//				self.run_translate_to_lang(img.clone(), ctx.clone(), "English");
-							//			}
-							//			ui.close_kind(egui::UiKind::Menu);
-							//		}
-
-							//		ui.separator();
-
-							//		if ui.button("翻译成中文").clicked() {
-							//			self.current_latex = None; 
-							//			self.show_ocr_window = false;
-							//			let image_to_send = self.last_ocr_image.as_ref().or(self.last_cropped_image.as_ref());
-							//			if let Some(img) = image_to_send {
-							//				self.run_translate_to_lang(img.clone(), ctx.clone(), "Chinese");
-							//			}
-							//			ui.close_kind(egui::UiKind::Menu);
-							//		}
-
-							//		ui.separator();
-
-							//		if ui.button("Translate to Spanish").clicked() {
-							//			self.current_latex = None; 
-							//			self.show_ocr_window = false;
-							//			let image_to_send = self.last_ocr_image.as_ref().or(self.last_cropped_image.as_ref());
-							//			if let Some(img) = image_to_send {
-							//				self.run_translate_to_lang(img.clone(), ctx.clone(), "Spanish");
-							//			}
-							//			ui.close_kind(egui::UiKind::Menu);
-							//		}
-
-							//		ui.separator();
-
-							//		// --- 特殊转换选项 ---
-							//		if ui.button("Generate TikZ Code").clicked() {
-							//			self.current_latex = None; 
-							//			self.show_ocr_window = false;
-							//			let image_to_send = self.last_ocr_image.as_ref().or(self.last_cropped_image.as_ref());
-							//			if let Some(img) = image_to_send {
-							//				self.run_geometry_to_tikz(img.clone(), ctx.clone());
-							//			}
-							//			ui.close_kind(egui::UiKind::Menu)
-							//		}
-
-
-							//		ui.separator();
-
-							//		let solve_text = egui::RichText::new("Solve the Problem")
-							//			.strong()
-							//			.color(egui::Color32::LIGHT_BLUE);
-
-							//		if ui.button(solve_text).clicked() {
-							//			let high_res_image = self.last_ocr_image.as_ref()
-							//				.or(self.last_cropped_image.as_ref())
-							//				.cloned();
-
-							//			if let Some(img) = high_res_image {
-							//				self.show_ocr_window = true;
-							//				self.solve_math_problem(
-							//					SolveSource::Image(image::DynamicImage::ImageRgba8(img)), 
-							//					ctx.clone()
-							//				);
-							//			}
-							//			ui.close_kind(egui::UiKind::Menu);
-							//		}
-
-							//	});
-							//});
 						});
 					});
 				});
@@ -2540,12 +2645,22 @@ impl PdfApp {
 		if should_close {
 			self.cropped_tex = None;
 			self.last_cropped_image = None;
+			self.last_selection_rect = None;
 		}
 		if should_copy {
 			if let Some(img) = &self.last_cropped_image {
 				copy_image_to_clipboard(img);
 			}
 			self.cropped_tex = None;
+			self.last_selection_rect = None;
+		}
+		if should_copy_text {
+			if let Some(text) = self.extract_text_in_selection() {
+				ctx.copy_text(text); 
+			}
+			self.cropped_tex = None;
+			self.last_cropped_image = None;
+			self.last_selection_rect = None;
 		}
 		if let Some(fmt) = save_format {
 			//self.save_image_with_format(fmt);
@@ -4432,9 +4547,16 @@ impl PdfApp {
 			// 默认值可以设为 gvim
 			let command_template = self.config.editor_command.clone(); 
 
+			let has_quotes = command_template.contains("\"{file}\"") || command_template.contains("'{file}'");
+			let safe_file = if has_quotes {
+				file.to_string() // 如果模板自带引号，直接用原路径
+			} else {
+				format!(r#""{}""#, file) // 如果模板没有引号，帮它加上双引号，防止空格断开
+			};
+
 			// 替换占位符
 			let final_command = command_template
-				.replace("{file}", file)
+				.replace("{file}", &safe_file)
 				.replace("{line}", line);
 
 			// 执行 shell 命令
@@ -4452,6 +4574,80 @@ impl PdfApp {
 				.spawn();
 		}
 	}
+}
+
+//文本提取逻辑
+//impl PdfApp {
+//    pub fn extract_text_in_selection(&self) -> Option<String> {
+//        self.extracted_text_cache.clone()
+//    }
+//}
+impl PdfApp {
+    pub fn extract_text_in_selection(&self) -> Option<String> {
+        let local_rect = self.last_selection_rect?;
+        if self.last_pdf_width <= 0.0 || self.last_pdf_height <= 0.0 {
+            return None;
+        }
+        let actual_ui_size = egui::vec2(self.last_pdf_width, self.last_pdf_height);
+
+        // 1. 获取本地 page 实例
+        let doc = self.pdf_doc.as_ref()?;
+        let page = doc.pages().get(self.current_page as u16).ok()?;
+
+        // 🌟 解决生命周期的关键：显式绑定 page_text，确保其在 page 之前释放
+        let page_text = page.text().ok()?;
+
+        let pdf_width_pts = page.width().value as f32;
+        let pdf_height_pts = page.height().value as f32;
+
+        // 1. 缩放比例
+        let scale_x = pdf_width_pts / actual_ui_size.x;
+        let scale_y = pdf_height_pts / actual_ui_size.y;
+
+        // 2. 换算 Egui 拉框到 PDF 物理坐标（镜像 Y 轴）
+        let pdf_min_x = local_rect.min.x * scale_x;
+        let pdf_max_x = local_rect.max.x * scale_x;
+        let pdf_min_y = pdf_height_pts - (local_rect.max.y * scale_y);
+        let pdf_max_y = pdf_height_pts - (local_rect.min.y * scale_y);
+
+        // 我们在 Y 轴和 X 轴加上正负 5.0 Points 的容错边界（允许字符部分擦边也被收纳进来）
+        let target_min_x = pdf_min_x - 5.0;
+        let target_max_x = pdf_max_x + 5.0;
+        let target_min_y = pdf_min_y - 5.0;
+        let target_max_y = pdf_max_y + 5.0;
+
+        let mut matched_chars = Vec::new();
+        let chars_list = page_text.chars();
+        let total_chars = chars_list.len();
+
+        // 3. 遍历全页所有的字符，只保留在我们选区范围内的字符
+        for i in 0..total_chars {
+            if let Ok(c) = chars_list.get(i) {
+                if let Ok(char_rect) = c.loose_bounds() {
+                    let char_x = char_rect.left().value;
+                    let char_y = char_rect.bottom().value;
+
+                    // 判定坐标是否在选区内
+                    if char_x >= target_min_x 
+                        && char_x <= target_max_x 
+                        && char_y >= target_min_y 
+                        && char_y <= target_max_y 
+                    {
+                        if let Some(ch) = c.unicode_char() {
+                            matched_chars.push(ch.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. 将匹配到的字符拼接起来并返回
+        if !matched_chars.is_empty() {
+            Some(matched_chars.concat())
+        } else {
+            None
+        }
+    }
 }
 
 //主循环
@@ -4599,6 +4795,32 @@ impl eframe::App for PdfApp {
 }
 //main函数
 fn main() -> eframe::Result<()> {
+	//0.图标
+	let icon_bytes = include_bytes!("../assets/pdf-reader.png");
+	let window_icon = match image::load_from_memory(icon_bytes) {
+		Ok(img) => {
+			let rgba = img.into_rgba8();
+			let (width, height) = rgba.dimensions();
+			Some(egui::IconData {
+				rgba: rgba.into_raw(),
+				width,
+				height,
+			})
+		}
+		_ => None, 
+	};
+	let viewport = egui::ViewportBuilder::default()
+			.with_inner_size([900.0, 1000.0]);
+	let viewport = if let Some(icon) = window_icon {
+		viewport.with_icon(icon)
+	} else {
+		viewport
+	};
+	let options = eframe::NativeOptions {
+		viewport,
+		..Default::default()
+	};
+
 	// 1. 提取命令行参数
 	let args: Vec<String> = std::env::args().collect();
 
@@ -4607,14 +4829,6 @@ fn main() -> eframe::Result<()> {
 		Some(std::path::PathBuf::from(&args[1]))
 	} else {
 		None
-	};
-
-	let options = eframe::NativeOptions {
-		viewport: egui::ViewportBuilder::default()
-			.with_active(true)
-			.with_inner_size([900.0, 1000.0]),
-			run_and_return: true,
-			..Default::default()
 	};
 
 	eframe::run_native(
@@ -4641,3 +4855,4 @@ fn main() -> eframe::Result<()> {
 		}),
 		)
 }
+
