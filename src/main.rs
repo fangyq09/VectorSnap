@@ -41,6 +41,12 @@ pub struct AppConfig {
     pub ocr_models: Vec<OcrModelConfig>,
     #[serde(default)]
     pub current_ocr_model_name: String,
+		#[serde(default = "default_true")]
+    pub auto_crop_dpi: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(target_os = "windows")]
@@ -79,6 +85,7 @@ impl Default for AppConfig {
 				},
 			],
 			current_ocr_model_name: "GLM-OCR".to_string(),
+			auto_crop_dpi: true,
 		}
 	}
 }
@@ -228,6 +235,7 @@ struct PdfApp {
 		last_pressure: f32,
 		last_time_stamp: f32,
 		//extracted_text_cache: Option<String>,
+		enable_auto_crop_dpi: bool,
 }
 
 fn load_config() -> AppConfig {
@@ -335,6 +343,7 @@ impl PdfApp {
 		let pdfium = Box::leak(Box::new(Pdfium::new(bindings)));
 
 		let config = load_config();
+		let initial_auto_crop_dpi = config.auto_crop_dpi;
 
 		let (api_url, api_token, model_id, provider) = config.ocr_models
 			.iter()
@@ -365,7 +374,7 @@ impl PdfApp {
 			last_ocr_image: None,
 			pdf_name: None,
 			pdf_path: None,
-			target_dpi: 600.0,
+			target_dpi: 300.0,
 			view_scale: 1.0,
 			zoom_factor: 1.0,
 			last_opened_dir: None,
@@ -427,6 +436,7 @@ impl PdfApp {
 			last_pressure: 0.0,
 			last_time_stamp: 0.0,
 			//extracted_text_cache: None,
+			enable_auto_crop_dpi: initial_auto_crop_dpi,
 		};
 
 		// 如果启动参数里有路径，直接调用加载函数
@@ -916,6 +926,12 @@ impl PdfApp {
 							.selected_text(format!("{}dpi", self.target_dpi)) // 显示当前选中的值
 							.width(40.0) // 固定宽度，让界面更整齐
 							.show_ui(ui, |ui| {
+								let mut auto_checked = self.enable_auto_crop_dpi;
+								if ui.checkbox(&mut auto_checked, "🔄 Auto DPI").changed() {
+									self.enable_auto_crop_dpi = auto_checked;
+									self.config.auto_crop_dpi = auto_checked; // 同步到 config
+									self.save_all_config();
+								}
 								ui.selectable_value(&mut self.target_dpi, 150.0, "150");
 								ui.selectable_value(&mut self.target_dpi, 200.0, "200");
 								ui.selectable_value(&mut self.target_dpi, 300.0, "300");
@@ -1148,7 +1164,7 @@ fn color_selector(
 			} else {
 				egui::Color32::GRAY
 			};
-			let stroke_width = if is_selected { 2.0 } else { 1.0 };
+			let stroke_width = if is_selected { 2.0_f32 } else { 1.0_f32 };
 
 			match shape {
 				ColorShape::Circle => {
@@ -1658,11 +1674,11 @@ impl PdfApp {
 				self.rotations = vec![0.0; page_count];
 				self.texture = None;
 
-				if let Some(doc_ref) = &self.pdf_doc {
-					if let Ok(page) = doc_ref.pages().get(self.current_page as u16) {
-						self.target_dpi = suggest_page_dpi(&page);
-					}
-				}
+				//if let Some(doc_ref) = &self.pdf_doc {
+				//	if let Ok(page) = doc_ref.pages().get(self.current_page as u16) {
+				//		self.target_dpi = suggest_page_dpi(&page);
+				//	}
+				//}
 
 				true // 返回加载成功
 			}
@@ -1697,66 +1713,66 @@ impl PdfApp {
 	}
 }
 //默认截图dpi
-fn suggest_page_dpi(page: &pdfium_render::prelude::PdfPage) -> f32 {
-    let objects = page.objects();
-    let p_w = page.width().value;
-    let p_h = page.height().value;
-    let page_area = p_w * p_h;
-
-    if page_area <= 0.0 { return 300.0; }
-
-    let mut score = 0i32;
-
-    // 1. 文字检测 (LaTeX 首页文字虽少，但只要有，就是矢量特征)
-    let char_count = page.text().map(|t| t.all().trim().len()).unwrap_or(0);
-    if char_count > 10 {
-        score += 50; // 有正式文字，极大概率是矢量 PDF
-    }
-    if char_count > 200 {
-        score += 100; // 文字多，铁定是矢量/排版 PDF
-    }
-
-    // 2. 对象类型深度扫描
-    let mut has_full_page_img = false;
-    let mut path_count = 0;
-    let mut img_count = 0;
-
-    for obj in objects.iter() {
-        match obj.object_type() {
-            PdfPageObjectType::Text => score += 5, // 每一个文本对象都是强矢量证据
-            PdfPageObjectType::Path => {
-                path_count += 1;
-                // LaTeX 的公式、线条、边框全是 Path
-                if path_count > 20 { score += 20; } 
-            },
-            PdfPageObjectType::Image => {
-                img_count += 1;
-                if let Ok(bounds) = obj.bounds() {
-                    let w = (bounds.right().value - bounds.left().value).abs();
-                    let h = (bounds.top().value - bounds.bottom().value).abs();
-                    // 只有几乎填满全屏的图片才扣分（扫描件特征）
-                    if (w * h) / page_area > 0.9 {
-                        has_full_page_img = true;
-                    }
-                }
-            },
-            _ => {}
-        }
-    }
-
-    // 3. 最终判定逻辑
-    // 扫描件判定条件：有巨型图片 且 (文字极少 且 矢量路径极少)
-    if has_full_page_img && char_count < 20 && path_count < 10 {
-        return 300.0;
-    }
-
-    // LaTeX 首页判定：即使文字少，但如果有 Path (Logo/线条) 或者 Image 很多且不是全屏
-    if score > 40 || (img_count > 0 && !has_full_page_img) {
-        return 600.0; 
-    }
-
-    300.0
-}
+//fn suggest_page_dpi(page: &pdfium_render::prelude::PdfPage) -> f32 {
+//    let objects = page.objects();
+//    let p_w = page.width().value;
+//    let p_h = page.height().value;
+//    let page_area = p_w * p_h;
+//
+//    if page_area <= 0.0 { return 300.0; }
+//
+//    let mut score = 0i32;
+//
+//    // 1. 文字检测 (LaTeX 首页文字虽少，但只要有，就是矢量特征)
+//    let char_count = page.text().map(|t| t.all().trim().len()).unwrap_or(0);
+//    if char_count > 10 {
+//        score += 50; // 有正式文字，极大概率是矢量 PDF
+//    }
+//    if char_count > 200 {
+//        score += 100; // 文字多，铁定是矢量/排版 PDF
+//    }
+//
+//    // 2. 对象类型深度扫描
+//    let mut has_full_page_img = false;
+//    let mut path_count = 0;
+//    let mut img_count = 0;
+//
+//    for obj in objects.iter() {
+//        match obj.object_type() {
+//            PdfPageObjectType::Text => score += 5, // 每一个文本对象都是强矢量证据
+//            PdfPageObjectType::Path => {
+//                path_count += 1;
+//                // LaTeX 的公式、线条、边框全是 Path
+//                if path_count > 20 { score += 20; } 
+//            },
+//            PdfPageObjectType::Image => {
+//                img_count += 1;
+//                if let Ok(bounds) = obj.bounds() {
+//                    let w = (bounds.right().value - bounds.left().value).abs();
+//                    let h = (bounds.top().value - bounds.bottom().value).abs();
+//                    // 只有几乎填满全屏的图片才扣分（扫描件特征）
+//                    if (w * h) / page_area > 0.9 {
+//                        has_full_page_img = true;
+//                    }
+//                }
+//            },
+//            _ => {}
+//        }
+//    }
+//
+//    // 3. 最终判定逻辑
+//    // 扫描件判定条件：有巨型图片 且 (文字极少 且 矢量路径极少)
+//    if has_full_page_img && char_count < 20 && path_count < 10 {
+//        return 200.0;
+//    }
+//
+//    // LaTeX 首页判定：即使文字少，但如果有 Path (Logo/线条) 或者 Image 很多且不是全屏
+//    if score > 40 || (img_count > 0 && !has_full_page_img) {
+//        return 400.0; 
+//    }
+//
+//    300.0
+//}
 //Reset
 impl PdfApp {
 	fn unload_pdf(&mut self) {
@@ -2279,7 +2295,7 @@ fn draw_eraser_cursor(&self, ui: &egui::Ui, mouse_pos: egui::Pos2) {
     ui.painter().rect_stroke(
         rect,
         0.0,
-        egui::Stroke::new(1.5, egui::Color32::from_black_alpha(200)),
+        egui::Stroke::new(1.5_f32, egui::Color32::from_black_alpha(200)),
         egui::StrokeKind::Middle,
     );
 }
@@ -2292,7 +2308,7 @@ fn draw_pen_cursor(&self, ui: &egui::Ui, mouse_pos: egui::Pos2) {
     painter.circle_stroke(
         mouse_pos,
         size * 0.5,
-        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(200)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(200)),
     );
 
     painter.circle_filled(
@@ -2458,6 +2474,10 @@ fn handle_selection_interaction(
     if response.drag_stopped() {
         if let Some(local_rect) = self.selection_rect_local {
 						self.last_selection_rect = Some(local_rect);
+						if self.enable_auto_crop_dpi {
+							let has_vector = check_selection_has_vector(page, local_rect, response.rect.size());
+							self.target_dpi = if has_vector { 400.0 } else { 200.0 };
+						}
 						// A. 先执行高分辨率裁剪
             self.perform_high_res_crop(ctx, page, local_rect, response.rect.size());
 						// B. 自动复制到剪贴板
@@ -2548,6 +2568,70 @@ fn handle_selection_interaction(
         );
     }
 }
+}
+// 检测选区内是否有矢量对象（文字或路径）
+fn check_selection_has_vector(
+    page: &pdfium_render::prelude::PdfPage,
+    local_rect: egui::Rect,
+    actual_ui_size: egui::Vec2,
+) -> bool {
+    let Ok(page_text) = page.text() else { return false; };
+    let pdf_width_pts = page.width().value as f32;
+    let pdf_height_pts = page.height().value as f32;
+
+    if pdf_width_pts <= 0.0 || pdf_height_pts <= 0.0 || actual_ui_size.x <= 0.0 || actual_ui_size.y <= 0.0 {
+        return false;
+    }
+
+    let scale_x = pdf_width_pts / actual_ui_size.x;
+    let scale_y = pdf_height_pts / actual_ui_size.y;
+
+    // 将选区坐标换算到 PDF 物理坐标系（注意 Y 轴反转）
+    let pdf_min_x = local_rect.min.x * scale_x;
+    let pdf_max_x = local_rect.max.x * scale_x;
+    let pdf_min_y = pdf_height_pts - (local_rect.max.y * scale_y);
+    let pdf_max_y = pdf_height_pts - (local_rect.min.y * scale_y);
+
+    // 加上 5.0 Points 的容错边界，防止边缘字符/线条漏掉
+    let sel_min_x = pdf_min_x.min(pdf_max_x) - 5.0;
+    let sel_max_x = pdf_min_x.max(pdf_max_x) + 5.0;
+    let sel_min_y = pdf_min_y.min(pdf_max_y) - 5.0;
+    let sel_max_y = pdf_min_y.max(pdf_max_y) + 5.0;
+
+    // 1. 检测选区内是否有文本对象 (Text)
+    let chars_list = page_text.chars();
+    let total_chars = chars_list.len();
+    for i in 0..total_chars {
+        if let Ok(c) = chars_list.get(i) {
+            if let Ok(char_rect) = c.loose_bounds() {
+                let char_x = char_rect.left().value;
+                let char_y = char_rect.bottom().value;
+                if char_x >= sel_min_x && char_x <= sel_max_x && char_y >= sel_min_y && char_y <= sel_max_y {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 2. 检测选区内是否有矢量路径 (Path) 对象
+    let objects = page.objects();
+    for obj in objects.iter() {
+        if obj.object_type() == PdfPageObjectType::Path {
+            if let Ok(bounds) = obj.bounds() {
+                let obj_left = bounds.left().value;
+                let obj_right = bounds.right().value;
+                let obj_bottom = bounds.bottom().value;
+                let obj_top = bounds.top().value;
+
+                // 判定路径包围盒与选区是否有交集
+                if obj_left < sel_max_x && obj_right > sel_min_x && obj_bottom < sel_max_y && obj_top > sel_min_y {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 //截图预览
 impl PdfApp {
@@ -4543,21 +4627,43 @@ impl PdfApp {
 		}
 
 		if !file.is_empty() && !line.is_empty() {
-			// 从配置中读取命令模板，例如: "gvim --remote-silent +{line} {file}"
-			// 默认值可以设为 gvim
-			let command_template = self.config.editor_command.clone(); 
+			//// 从配置中读取命令模板，例如: "gvim --remote-silent +{line} {file}"
+			//// 默认值可以设为 gvim
+			//let command_template = self.config.editor_command.clone(); 
 
-			let has_quotes = command_template.contains("\"{file}\"") || command_template.contains("'{file}'");
-			let safe_file = if has_quotes {
-				file.to_string() // 如果模板自带引号，直接用原路径
-			} else {
-				format!(r#""{}""#, file) // 如果模板没有引号，帮它加上双引号，防止空格断开
+			//let has_quotes = command_template.contains("\"{file}\"") || command_template.contains("'{file}'");
+			//let safe_file = if has_quotes {
+			//	file.to_string() // 如果模板自带引号，直接用原路径
+			//} else {
+			//	format!(r#""{}""#, file) // 如果模板没有引号，帮它加上双引号，防止空格断开
+			//};
+
+			//// 替换占位符
+			//let final_command = command_template
+			//	.replace("{file}", &safe_file)
+			//	.replace("{line}", line);
+			let raw_cmd = self.config.editor_command.trim();
+			let editor_lower = raw_cmd.to_lowercase();
+			let base_editor = editor_lower.strip_suffix(".exe").unwrap_or(&editor_lower);
+
+			// 根据编辑器类型自动拼接参数，避免转义错误
+			let final_command = match base_editor {
+				"gvim" | "vim" => {
+					format!("{} --remote-silent +{} \"{}\"", raw_cmd, line, file)
+				}
+				"nvim" | "neovide" => {
+					format!("{} +{} \"{}\"", raw_cmd, line, file)
+				}
+				_ => {
+					// 其他非 Vim 类编辑器，读取完整的模板参数
+					let has_quotes = raw_cmd.contains("\"{file}\"") || raw_cmd.contains("'{file}'");
+					let safe_file = if has_quotes { file.to_string() } else { format!(r#""{}""#, file) };
+
+					raw_cmd
+						.replace("{file}", &safe_file)
+						.replace("{line}", line)
+				}
 			};
-
-			// 替换占位符
-			let final_command = command_template
-				.replace("{file}", &safe_file)
-				.replace("{line}", line);
 
 			// 执行 shell 命令
 			//// 在 Linux 下使用 sh -c 可以方便地处理复杂的带参数命令
@@ -4568,20 +4674,19 @@ impl PdfApp {
 				.spawn();
 
 			#[cfg(target_os = "windows")]
-			let _ = std::process::Command::new("cmd")
-				.arg("/C")
-				.arg(final_command)
-				.spawn();
+			{
+				use std::os::windows::process::CommandExt;
+				const CREATE_NO_WINDOW: u32 = 0x08000000;
+				let _ = std::process::Command::new("cmd")
+					.arg("/C")
+					.arg(final_command)
+					.creation_flags(CREATE_NO_WINDOW)
+					.spawn();
+			}
 		}
 	}
 }
 
-//文本提取逻辑
-//impl PdfApp {
-//    pub fn extract_text_in_selection(&self) -> Option<String> {
-//        self.extracted_text_cache.clone()
-//    }
-//}
 impl PdfApp {
     pub fn extract_text_in_selection(&self) -> Option<String> {
         let local_rect = self.last_selection_rect?;
@@ -4824,12 +4929,31 @@ fn main() -> eframe::Result<()> {
 	// 1. 提取命令行参数
 	let args: Vec<String> = std::env::args().collect();
 
-	// 2. 尝试获取路径（注意：索引 0 是程序名，索引 1 才是文件路径）
-	let initial_pdf_path = if args.len() > 1 {
-		Some(std::path::PathBuf::from(&args[1]))
-	} else {
-		None
-	};
+	//// 2. 尝试获取路径（注意：索引 0 是程序名，索引 1 才是文件路径）
+	//let initial_pdf_path = if args.len() > 1 {
+	//	Some(std::path::PathBuf::from(&args[1]))
+	//} else {
+	//	None
+	//};
+	let mut initial_pdf_path = None;
+	let mut target_page_override: Option<usize> = None;
+
+	let mut i = 1;
+	while i < args.len() {
+		if args[i] == "--page" && i + 1 < args.len() {
+			// 解析 --page 后面的页码数字 (用户输入的通常从 1 开始，转为 0-based 索引)
+			if let Ok(p) = args[i + 1].parse::<usize>() {
+				target_page_override = Some(p.saturating_sub(1));
+			}
+			i += 2;
+		} else {
+			// 如果不是 --page 及其参数，且还没找到文件路径，则认为是 PDF 路径
+			if initial_pdf_path.is_none() {
+				initial_pdf_path = Some(std::path::PathBuf::from(&args[i]));
+			}
+			i += 1;
+		}
+	}
 
 	eframe::run_native(
 		"VectorSnap",
@@ -4851,7 +4975,16 @@ fn main() -> eframe::Result<()> {
 				));
 			}
 			setup_fonts(&cc.egui_ctx);
-			Ok(Box::new(PdfApp::new(cc, initial_pdf_path)))
+			//Ok(Box::new(PdfApp::new(cc, initial_pdf_path)))
+
+			// 初始化 App
+			let mut app = PdfApp::new(cc, initial_pdf_path);
+			// 如果命令行指定了目标页码，覆盖初始页码
+			if let Some(p) = target_page_override {
+				app.current_page = p;
+				app.texture = None;
+			}
+			Ok(Box::new(app))
 		}),
 		)
 }
