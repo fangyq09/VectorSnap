@@ -1,4 +1,4 @@
-# VectorSnap 📸The Educator's High-Resolution PDF Toolkit
+## VectorSnap 📸The Educator's High-Resolution PDF Toolkit
 
 VectorSnap is a lightweight, high-performance PDF viewer and snippet tool specifically designed for educators. Instead of struggling with blurry screenshots from standard PDF readers, VectorSnap allows you to capture ultra-high-definition (600 DPI+) images from your PDF materials—perfect for creating crystal-clear PowerPoint slides, exam papers, and digital handouts.
 
