@@ -5,6 +5,7 @@ use pdfium_render::prelude::{PdfColor, PdfRenderConfig};
 
 use crate::PdfApp;
 use crate::copy_image_to_clipboard;
+use crate::get_config_dir;
 
 
 //LaTeX代码预览
@@ -180,22 +181,29 @@ pub fn normalize_latex(content: &str) -> String {
 			format!("{}\n\\end{{document}}", trimmed)
 		}
 	} else {
-		// 片段格式：包装成标准 standalone 格式并返回
+		// 从 config 目录读取 template.tex
+		//模板中包含约定的占位符（{{content}}），将片段替换进去
+		let template_path = get_config_dir().join("template.tex");
+
+		if let Ok(template_content) = std::fs::read_to_string(&template_path) {
+			if template_content.contains("{{content}}") {
+				return template_content.replace("{{content}}", trimmed);
+			}
+		}
+
+    // 兜底默认模板，格式：包装成标准 standalone 格式并返回
 		// 这样用户在 UI 里就能看到完整的代码结构，方便他们添加其他宏包
-		format!(
-			r#"\documentclass[border=2pt, preview]{{standalone}}
-\usepackage{{amsmath, amsfonts, amssymb, bm,enumitem, tikz, varwidth}}
-\setenumerate[1]{{itemsep=5pt,partopsep=0pt,parsep=5pt,topsep=5pt}}
-\setitemize[1]{{itemsep=5pt,partopsep=0pt,parsep=5pt,topsep=5pt, leftmargin=2pc}}
-\begin{{document}}
-\begin{{varwidth}}{{\linewidth}}
+		let preamble = r#"\documentclass[border=2pt, preview]{standalone}
+		\usepackage{amsmath, amsfonts, amssymb, bm, enumitem, varwidth}
+		\setenumerate[1]{itemsep=5pt,partopsep=0pt,parsep=5pt,topsep=5pt}
+		\setitemize[1]{itemsep=5pt,partopsep=0pt,parsep=5pt,topsep=5pt, leftmargin=2pc}
+		\begin{document}
+		\begin{varwidth}{\linewidth}"#;
 
-{}
+		let postamble = r#"\end{varwidth}
+		\end{document}"#;
 
-\end{{varwidth}}
-\end{{document}}"#,
-				trimmed
-		)
+		format!("{}\n\n{}\n\n{}", preamble, trimmed, postamble)
 	}
 }
 fn compile_to_pdf(content: &str) -> Result<Vec<u8>, String> {

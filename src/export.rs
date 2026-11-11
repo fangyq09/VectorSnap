@@ -84,6 +84,8 @@ impl PdfApp {
 			self.show_export_window = false;
 		}
 	}
+}
+impl PdfApp {
 	fn save_image_to_path(&self, img_data: image::DynamicImage, path: &std::path::Path, extension: &str) {
 		let ext_lower = extension.to_lowercase();
 
@@ -106,51 +108,55 @@ impl PdfApp {
 			let _ = img_data.save(path);
 		}
 	}
-	fn export_current_page_with_format(&mut self, extension: &str) {
-    let Some(doc) = &self.pdf_doc else { return; };
-    let Ok(page) = doc.pages().get(self.current_page as u16) else { return; };
-
-    let page_width_pt = page.width().value;
-    let target_width = (page_width_pt / 72.0 * self.target_dpi) as i32;
-
-    let config = PdfRenderConfig::new().set_target_width(target_width);
-    let render_res = page.render_with_config(&config);
-
-    if let Ok(render) = render_res {
-        let img_data_rgba = render.as_image().to_rgba8();
-        let mut img_data = image::DynamicImage::ImageRgba8(img_data_rgba);
-
-        if self.is_edit_mode {
-            // 关键：按统一顺序渲染到图片上
-            if let Some(annos) = self.annotations.get(&self.current_page) {
-                let (img_w, img_h) = img_data.dimensions();
-                
-                for anno in annos {
-                    match anno {
-                        Annotation::Pen(stroke) => {
-                            self.draw_pen_on_image(&mut img_data, stroke, img_w, img_h);
-                        }
-                        Annotation::Eraser(stroke) => {
-                            self.draw_eraser_on_image(&mut img_data, stroke, img_w, img_h);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 保存文件部分
-        let base_name = self.pdf_name.as_deref().unwrap_or("Document");
-        let default_name = format!("{}_Page_{}.{}", base_name, self.current_page + 1, extension);
-
-        if let Some(path) = rfd::FileDialog::new()
-            .set_file_name(&default_name)
-            .add_filter(extension, &[extension])
-            .save_file() 
-        {
-            self.save_image_to_path(img_data, &path, extension);
-        }
-    }
 }
+impl PdfApp {
+	fn export_current_page_with_format(&mut self, extension: &str) {
+		let Some(doc) = &self.pdf_doc else { return; };
+		let Ok(page) = doc.pages().get(self.current_page as u16) else { return; };
+
+		let page_width_pt = page.width().value;
+		let target_width = (page_width_pt / 72.0 * self.target_dpi) as i32;
+
+		let config = PdfRenderConfig::new().set_target_width(target_width);
+		let render_res = page.render_with_config(&config);
+
+		if let Ok(render) = render_res {
+			let img_data_rgba = render.as_image().to_rgba8();
+			let mut img_data = image::DynamicImage::ImageRgba8(img_data_rgba);
+
+			if self.is_edit_mode {
+				// 关键：按统一顺序渲染到图片上
+				if let Some(annos) = self.annotations.get(&self.current_page) {
+					let (img_w, img_h) = img_data.dimensions();
+
+					for anno in annos {
+						match anno {
+							Annotation::Pen(stroke) => {
+								self.draw_pen_on_image(&mut img_data, stroke, img_w, img_h);
+							}
+							Annotation::Eraser(stroke) => {
+								self.draw_eraser_on_image(&mut img_data, stroke, img_w, img_h);
+							}
+						}
+					}
+				}
+			}
+
+			// 保存文件部分
+			let base_name = self.pdf_name.as_deref().unwrap_or("Document");
+			let default_name = format!("{}_Page_{}.{}", base_name, self.current_page + 1, extension);
+
+			if let Some(path) = rfd::FileDialog::new()
+				.set_file_name(&default_name)
+					.add_filter(extension, &[extension])
+					.save_file() 
+			{
+				self.save_image_to_path(img_data, &path, extension);
+			}
+		}
+	}
+}
+impl PdfApp {
 	fn extract_current_page_pdf(&mut self) {
 		// 1. 安全检查：确保 PDF 已加载
 		let Some(doc) = &self.pdf_doc else { return; };
@@ -204,6 +210,8 @@ impl PdfApp {
 			} 
 		}
 	}
+}
+impl PdfApp {
 	fn parse_page_range(&self, input: &str, max_pages: u16) -> Vec<u16> {
 		let mut pages = Vec::new();
 
@@ -254,6 +262,8 @@ impl PdfApp {
 		pages.dedup();
 		pages
 	}
+}
+impl PdfApp {
 	fn export_pages_bulk(&mut self, extension: &str) {
 		let Some(doc) = &self.pdf_doc else { return; };
 		let total_pages = doc.pages().len();
@@ -282,6 +292,8 @@ impl PdfApp {
 			}
 		}
 	}
+}
+impl PdfApp {
 	fn extract_pages_as_single_pdf(&mut self) {
 		let Some(doc) = &self.pdf_doc else { return; };
 		let Some(original_path) = &self.pdf_path else { return; };
@@ -360,6 +372,8 @@ impl PdfApp {
 			}
 		}
 	}
+}
+impl PdfApp {
 	fn generate_range_string(&self, indices: &[u16]) -> String {
 		if indices.is_empty() { return String::new(); }
 
@@ -391,4 +405,3 @@ impl PdfApp {
 		result.join("_")
 	}
 }
-

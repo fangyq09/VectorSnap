@@ -282,3 +282,304 @@ impl PdfApp {
 	}
 }
 
+
+impl PdfApp {
+	pub	fn handle_edit_mode(&mut self, ui: &mut egui::Ui, aligned_rect: egui::Rect) {
+		let resp = ui.interact(
+			aligned_rect,
+			ui.id().with("edit_layer"),
+			egui::Sense::drag(),
+		);
+
+		// 当前鼠标位置（统一转换）
+		let pointer_pos = resp.interact_pointer_pos();
+
+		// =========================================================
+		// 1. 处理输入（只负责“收集数据”，不负责绘制）
+		// =========================================================
+		if let Some(pos) = pointer_pos {
+			let p = self.to_normalized(pos, aligned_rect);
+
+			match self.tool_mode {
+				ToolMode::Pen => {
+					let now = ui.input(|i| i.time) as f32;
+					let p = self.to_normalized(pos, aligned_rect);
+					let hardware_force = ui.input(|i| {
+						i.events.iter().find_map(|e| {
+							if let egui::Event::Touch { force, .. } = e {
+								*force 
+							} else {
+								None
+							}
+						})
+					});
+
+					if resp.drag_started() {
+						let now = ui.input(|i| i.time) as f32;
+						self.last_time_stamp = now; // 初始化时间
+						let start_pressure = hardware_force.unwrap_or(0.5);
+            self.last_pressure = start_pressure;
+            self.current_pen_stroke = vec![StrokePoint { 
+                pos: p, 
+                width: self.pen_size * start_pressure 
+            }];
+					} else if resp.dragged() {
+						if let Some(last_point) = self.current_pen_stroke.last() {
+							// 计算位移和速度 (使用像素单位更准确)
+							let dist = last_point.pos.distance(p) * aligned_rect.width();
+							let dt = (now - self.last_time_stamp).max(0.001);
+							let speed = dist / dt;
+							self.last_time_stamp = now;
+
+							// 压力模型
+							let target_pressure = if let Some(force) = hardware_force {
+								force
+							} else {
+								//1.0 - (speed / 1200.0).min(0.6)
+								0.8 + (speed / 2000.0).min(0.4)
+							};
+
+							// 低通滤波平滑压力，消除手部抖动带来的粗细突变
+							let alpha = 0.4; // 越小越平滑，越大响应越快
+							let smooth_pressure = self.last_pressure * (1.0 - alpha) + target_pressure * alpha;
+							self.last_pressure = smooth_pressure;
+
+							if last_point.pos != p {
+								self.current_pen_stroke.push(StrokePoint {
+									pos: p,
+									width: self.pen_size * smooth_pressure,
+								});
+							}
+						}
+					}
+				}
+
+				ToolMode::Eraser => {
+					if resp.drag_started() {
+						self.current_eraser_stroke.clear();
+						self.current_eraser_stroke.push(p);
+					} else if resp.dragged() {
+						if self.current_eraser_stroke.last() != Some(&p) {
+							self.current_eraser_stroke.push(p);
+						}
+					}
+				}
+			}
+		}
+
+		// =========================================================
+		// 2. 收尾（保存数据）
+		// =========================================================
+		if resp.drag_stopped() {
+			match self.tool_mode {
+				ToolMode::Pen => {
+					if !self.current_pen_stroke.is_empty() {
+						let stroke = Stroke {
+							points: self.current_pen_stroke.clone(),
+							color: self.pen_color,
+						};
+						self.annotations
+							.entry(self.current_page)
+							.or_default()
+							.push(Annotation::Pen(stroke)); // 统一推入
+					}
+					self.current_pen_stroke.clear();
+				}
+				ToolMode::Eraser => {
+					if !self.current_eraser_stroke.is_empty() {
+						let stroke = EraseStroke {
+							points: self.current_eraser_stroke.clone(),
+							brush_size: self.eraser_size,
+							color: self.eraser_color,
+						};
+						self.annotations
+							.entry(self.current_page)
+							.or_default()
+							.push(Annotation::Eraser(stroke)); // 统一推入
+					}
+					self.current_eraser_stroke.clear();
+				}
+			}
+		}
+
+		// =========================================================
+		// 3. 渲染（只负责画，不负责改数据）
+		// =========================================================
+		let painter = ui.painter().with_clip_rect(aligned_rect);
+
+		// -------- 当前正在画的 --------
+		if self.current_pen_stroke.len() >= 2 {
+			//self.draw_pressure_segments(&painter, &self.current_pen_stroke, aligned_rect, self.pen_color);
+			self.draw_pressure_segments(&painter, &self.current_pen_stroke, aligned_rect, self.pen_color);
+		}
+		if self.current_eraser_stroke.len() >= 2 {
+			let pts: Vec<egui::Pos2> = self.current_eraser_stroke.iter()
+				.map(|p| self.from_normalized(*p, aligned_rect))
+				.collect();
+				painter.add(egui::Shape::line(pts, egui::Stroke::new(self.eraser_size, self.eraser_color)));
+		}
+
+		// =========================================================
+		// 4. 光标
+		// =========================================================
+		self.draw_tool_cursor(ui, aligned_rect);
+	}
+}
+impl PdfApp {
+fn draw_pressure_segments(
+    &self,
+    painter: &egui::Painter,
+    stroke: &[StrokePoint],
+    rect: egui::Rect,
+    color: egui::Color32,
+) {
+    if stroke.len() < 2 { return; }
+    
+    // 转换为屏幕坐标和宽度
+    let pts: Vec<(egui::Pos2, f32)> = stroke.iter()
+        .map(|p| (self.from_normalized(p.pos, rect), p.width))
+        .collect();
+
+    if pts.len() < 3 {
+        painter.line_segment(
+            [pts[0].0, pts[1].0], 
+            egui::Stroke::new(pts[1].1, color)
+        );
+        return;
+    }
+
+    for i in 0..pts.len() - 2 {
+        let p0 = pts[i];
+        let p1 = pts[i+1];
+        let p2 = pts[i+2];
+
+        let mid_start = p0.0.lerp(p1.0, 0.5);
+        let mid_end = p1.0.lerp(p2.0, 0.5);
+
+        let steps = 5;
+        for s in 0..steps {
+            let t = s as f32 / steps as f32;
+            let t_next = (s + 1) as f32 / steps as f32;
+
+            // 二次贝塞尔插值
+            let pos_curr = mid_start.lerp(p1.0, t).lerp(p1.0.lerp(mid_end, t), t);
+            let pos_next = mid_start.lerp(p1.0, t_next).lerp(p1.0.lerp(mid_end, t_next), t_next);
+
+            // 手动实现 f32 的 lerp: start + (end - start) * t
+            let current_width = p1.1 + (p2.1 - p1.1) * t;
+
+            painter.line_segment(
+                [pos_curr, pos_next],
+                egui::Stroke::new(current_width, color)
+            );
+        }
+    }
+}
+}
+impl PdfApp {
+	pub fn paint_static_annotations(&self, ui: &mut egui::Ui, aligned_rect: egui::Rect) {
+		let painter = ui.painter().with_clip_rect(aligned_rect);
+
+		if let Some(annos) = self.annotations.get(&self.current_page) {
+			for anno in annos {
+				match anno {
+					Annotation::Pen(stroke) => {
+						if stroke.points.len() >= 2 {
+							self.draw_pressure_segments(&painter, &stroke.points, aligned_rect, stroke.color);
+						}
+					}
+					Annotation::Eraser(stroke) => {
+						if stroke.points.len() >= 2 {
+							let pts: Vec<egui::Pos2> = stroke.points.iter()
+								.map(|p| self.from_normalized(*p, aligned_rect))
+								.collect();
+							painter.add(egui::Shape::line(
+									pts,
+									egui::Stroke::new(stroke.brush_size, stroke.color),
+							));
+						}
+					}
+				}
+			}
+		}
+	}
+}
+impl PdfApp {
+fn to_normalized(&self, pos: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        (pos.x - rect.min.x) / rect.width(),
+        (pos.y - rect.min.y) / rect.height(),
+    )
+}
+fn from_normalized(&self, p: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        rect.min.x + p.x * rect.width(),
+        rect.min.y + p.y * rect.height(),
+    )
+}
+fn current_brush_color(&self) -> egui::Color32 {
+    match self.tool_mode {
+        ToolMode::Pen => self.pen_color,
+        ToolMode::Eraser => egui::Color32::WHITE,
+    }
+}
+
+fn current_brush_size(&self) -> f32 {
+    match self.tool_mode {
+        ToolMode::Pen => self.pen_size,
+        ToolMode::Eraser => self.eraser_size,
+    }
+}
+fn draw_tool_cursor(&self, ui: &egui::Ui, rect: egui::Rect) {
+    let Some(mouse_pos) = ui.ctx().pointer_hover_pos() else {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+        return;
+    };
+
+    let ui_blocking = ui.ctx().wants_pointer_input();
+
+    if ui_blocking || !rect.contains(mouse_pos) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+        return;
+    }
+
+    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+
+    match self.tool_mode {
+        ToolMode::Eraser => self.draw_eraser_cursor(ui, mouse_pos),
+        ToolMode::Pen => self.draw_pen_cursor(ui, mouse_pos),
+    }
+}
+fn draw_eraser_cursor(&self, ui: &egui::Ui, mouse_pos: egui::Pos2) {
+    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+
+    let size = self.current_brush_size();
+    let rect = egui::Rect::from_center_size(mouse_pos, egui::vec2(size, size));
+
+    ui.painter().rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.5_f32, egui::Color32::from_black_alpha(200)),
+        egui::StrokeKind::Middle,
+    );
+}
+fn draw_pen_cursor(&self, ui: &egui::Ui, mouse_pos: egui::Pos2) {
+    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+
+    let painter = ui.painter();
+    let size = self.current_brush_size();
+
+    painter.circle_stroke(
+        mouse_pos,
+        size * 0.5,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(200)),
+    );
+
+    painter.circle_filled(
+        mouse_pos,
+        2.0,
+        self.current_brush_color(),
+    );
+}
+}
+

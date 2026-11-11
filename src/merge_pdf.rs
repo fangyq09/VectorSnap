@@ -1,4 +1,7 @@
 use eframe::egui;
+use lopdf::{Document, Object};
+use lopdf::content::Operation;
+use std::path::Path;
 
 use crate::PdfApp;
 
@@ -10,13 +13,27 @@ impl PdfApp {
 		// 1. 定义局部变量用于同步右上角关闭按钮
 		let mut open = self.show_merge_window;
 
-		egui::Window::new("Merge Files to PDF")
+		let window_response = egui::Window::new("Merge Files to PDF")
 			.open(&mut open)
 			.resizable(true)
 			.default_width(400.0)
 			.show(ctx, |ui| {
 				ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
 				ui.vertical(|ui| {
+					ui.horizontal(|ui| {
+						ui.checkbox(
+							&mut self.force_a4,
+							"Force all pages to A4"
+						)
+							.on_hover_text(
+								"Resize all pages to A4 paper size.\n\
+				 				Content is proportionally scaled and centered.\n\
+				 				Original page orientation is preserved."
+							);
+					});
+
+					ui.separator();
+
 					ui.label("Add PDF files or Images to merge them into one PDF.");
 
 					ui.columns(2, |columns| {
@@ -47,6 +64,8 @@ impl PdfApp {
 						let mut to_remove = None;
 						let mut move_up = None;
 						let mut move_down = None;
+						let mut move_to_first = None;
+						let mut move_to_last = None;
 						let len = self.merge_file_list.len();
 						for (i, path) in self.merge_file_list.iter().enumerate() {
 							ui.horizontal(|ui| {
@@ -59,6 +78,14 @@ impl PdfApp {
                     if ui.button("❌").on_hover_text("Remove").clicked() {
                         to_remove = Some(i);
                     }
+
+
+										// 移动到末尾
+										ui.add_enabled_ui(i < len - 1, |ui| {
+											if ui.button("⏭").on_hover_text("Move to Last").clicked() {
+												move_to_last = Some(i);
+											}
+										});
 
                     // 下移按钮：最后一项不可点击
                     ui.add_enabled_ui(i < len - 1, |ui| {
@@ -73,12 +100,32 @@ impl PdfApp {
                             move_up = Some(i);
                         }
                     });
+
+										// 移动到首行
+										ui.add_enabled_ui(i > 0, |ui| {
+											if ui.button("⏮").on_hover_text("Move to First").clicked() {
+												move_to_first = Some(i);
+											}
+										});
                 });
 							});
 						}
-						if let Some(idx) = to_remove { self.merge_file_list.remove(idx); }
-						if let Some(idx) = move_up { self.merge_file_list.swap(idx, idx - 1); }
-						if let Some(idx) = move_down { self.merge_file_list.swap(idx, idx + 1); }
+						//if let Some(idx) = to_remove { self.merge_file_list.remove(idx); }
+						//if let Some(idx) = move_up { self.merge_file_list.swap(idx, idx - 1); }
+						//if let Some(idx) = move_down { self.merge_file_list.swap(idx, idx + 1); }
+						if let Some(idx) = to_remove {
+							self.merge_file_list.remove(idx);
+						} else if let Some(idx) = move_to_first {
+							let item = self.merge_file_list.remove(idx);
+							self.merge_file_list.insert(0, item);
+						} else if let Some(idx) = move_to_last {
+							let item = self.merge_file_list.remove(idx);
+							self.merge_file_list.push(item);
+						} else if let Some(idx) = move_up {
+							self.merge_file_list.swap(idx, idx - 1);
+						} else if let Some(idx) = move_down {
+							self.merge_file_list.swap(idx, idx + 1);
+						}
 					});
 
 					ui.separator();
@@ -94,6 +141,14 @@ impl PdfApp {
 					ui.add_space(5.0);
 				});
 			});
+
+			// 处理拖入合并窗口的文件
+			if let Some(response) = window_response {
+				self.handle_merge_window_drag_drop(
+					ctx,
+					response.response.rect,
+				);
+			}
 
 		// 3. 同步状态：如果用户点了右上角的 X，open 会变 false
 		if !open {
@@ -187,7 +242,6 @@ impl PdfApp {
 									destination_index
 								);
 								has_content = true;
-								//println!("图片通过 Rust 中转成功: {:?}", path.file_name().unwrap());
 							}
 						}
 					}
@@ -197,17 +251,210 @@ impl PdfApp {
 			if has_content {
 				println!("合并PDF总页数: {}", new_doc.pages().len());
 
-				let save_res = new_doc.save_to_file(&save_path);
+				match new_doc.save_to_file(&save_path) {
+					Ok(_) => {
+						// 如果勾选 A4，则进一步调整所有页面
+						if self.force_a4 {
+							match force_all_pages_to_a4(&save_path) {
+								Ok(_) => {
+									println!("所有页面已成功调整为 A4: {:?}", save_path);
+								}
+								Err(e) => {
+									eprintln!("A4 页面调整失败: {:?}", e);
+								}
+							}
+						}
 
-				match save_res {
-					Ok(_) => println!("保存成功: {:?}", save_path),
-					Err(e) => eprintln!("保存失败: {:?}", e),
+						println!("保存成功: {:?}", save_path);
+					}
+
+					Err(e) => {
+						eprintln!("保存失败: {:?}", e);
+					}
 				}
 			}
 
-			//if let Err(e) = new_doc.save_to_file(&save_path) {
-			//	eprintln!("Save failed: {:?}", e);
-			//}
 		}
 	}
+}
+
+// 将所有 PDF 页面适配为 A4，保留原始方向和内容比例
+fn force_all_pages_to_a4(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut doc = Document::load(path)?;
+
+    // A4 尺寸，单位：PDF points
+    const A4_W: f32 = 595.276;
+    const A4_H: f32 = 841.890;
+
+    let pages = doc.get_pages();
+
+    for (_page_number, page_id) in pages {
+        // 获取页面 MediaBox（考虑从父节点继承）
+        let media_box = {
+            let mut current_id = page_id;
+            let mut result = None;
+
+            loop {
+                let dict = doc.get_dictionary(current_id)?;
+
+                if let Ok(value) = dict.get(b"MediaBox") {
+                    result = match value {
+                        Object::Array(arr) => Some(arr.clone()),
+                        Object::Reference(id) => {
+                            match doc.get_object(*id)? {
+                                Object::Array(arr) => Some(arr.clone()),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    if result.is_some() {
+                        break;
+                    }
+                }
+
+                match dict.get(b"Parent") {
+                    Ok(Object::Reference(parent_id)) => {
+                        current_id = *parent_id;
+                    }
+                    _ => break,
+                }
+            }
+
+            result.ok_or("Cannot find page MediaBox")?
+        };
+
+        if media_box.len() != 4 {
+            return Err("Invalid MediaBox".into());
+        }
+
+        let get_num = |obj: &Object| -> Result<f32, Box<dyn std::error::Error>> {
+            match obj {
+                Object::Integer(v) => Ok(*v as f32),
+                Object::Real(v) => Ok(*v),
+                _ => Err("Invalid MediaBox coordinate".into()),
+            }
+        };
+
+        let x0 = get_num(&media_box[0])?;
+        let y0 = get_num(&media_box[1])?;
+        let x1 = get_num(&media_box[2])?;
+        let y1 = get_num(&media_box[3])?;
+
+        let old_w = x1 - x0;
+        let old_h = y1 - y0;
+
+        if old_w <= 0.0 || old_h <= 0.0 {
+            continue;
+        }
+
+        // 保留原页面方向：横向页面使用横向 A4
+        let (target_w, target_h) = if old_w > old_h {
+            (A4_H, A4_W)
+        } else {
+            (A4_W, A4_H)
+        };
+
+        // 等比例缩放，确保完整显示
+        let scale = (target_w / old_w).min(target_h / old_h);
+
+        // 居中
+        let translate_x = (target_w - old_w * scale) / 2.0 - x0 * scale;
+        let translate_y = (target_h - old_h * scale) / 2.0 - y0 * scale;
+
+        // 获取原始页面内容
+        let mut content = doc.get_and_decode_page_content(page_id)?;
+
+        // q：保存原始图形状态
+        content.operations.insert(
+            0,
+            Operation::new("q", vec![]),
+        );
+
+        // cm：应用缩放和平移矩阵
+        content.operations.insert(
+            1,
+            Operation::new(
+                "cm",
+                vec![
+                    Object::Real(scale),
+                    Object::Integer(0),
+                    Object::Integer(0),
+                    Object::Real(scale),
+                    Object::Real(translate_x),
+                    Object::Real(translate_y),
+                ],
+            ),
+        );
+
+        // Q：恢复图形状态
+        content.operations.push(
+            Operation::new("Q", vec![]),
+        );
+
+        // 写回页面内容
+        doc.change_page_content(page_id, content.encode()?)?;
+
+        // 修改页面尺寸
+        let page_dict = doc.get_object_mut(page_id)?.as_dict_mut()?;
+
+        let a4_box = Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Real(target_w),
+            Object::Real(target_h),
+        ]);
+
+        page_dict.set("MediaBox", a4_box.clone());
+        page_dict.set("CropBox", a4_box);
+
+        // 避免旧的页面边界继续限制显示
+        page_dict.remove(b"TrimBox");
+        page_dict.remove(b"BleedBox");
+        page_dict.remove(b"ArtBox");
+    }
+
+    // 保存调整后的 PDF
+    doc.save(path)?;
+
+    Ok(())
+}
+
+impl PdfApp {
+    fn handle_merge_window_drag_drop(
+        &mut self,
+        ctx: &egui::Context,
+        window_rect: egui::Rect,
+    ) {
+        // 获取拖入文件和鼠标位置
+        let (dropped_paths, pointer_pos) = ctx.input(|i| {
+            let paths = i.raw.dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect::<Vec<_>>();
+
+            (paths, i.pointer.latest_pos())
+        });
+
+        // 只接收释放在合并窗口内部的文件
+        if let Some(pos) = pointer_pos {
+            if window_rect.contains(pos) {
+                for path in dropped_paths {
+                    let ext = path.extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+
+                    // 支持 PDF 和常见图片
+                    if ["pdf", "png", "jpg", "jpeg"].contains(&ext.as_str()) {
+                        // 避免重复添加
+                        if !self.merge_file_list.contains(&path) {
+                            self.merge_file_list.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

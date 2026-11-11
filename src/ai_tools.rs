@@ -484,11 +484,13 @@ impl PdfApp {
 
 				let output = std::process::Command::new(exe)
 					.arg("-m").arg(model)
+					.arg("--jinja")
 					.arg("--mmproj").arg(mmproj)
 					.arg("--image").arg(&img_path_str)
 					.arg("--temp").arg("0.1")
 					.arg("-p").arg(prompt)
-					.arg("-n").arg("1024")
+					.arg("-n").arg("2048")
+					.arg("-c").arg("16384")
 					.output().ok()?;
 
 				if !output.status.success() { return None; }
