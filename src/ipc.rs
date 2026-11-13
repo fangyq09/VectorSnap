@@ -9,8 +9,12 @@ pub struct IpcMessage {
     pub path: Option<PathBuf>,
     pub page: Option<usize>,
     pub servername: Option<String>,
+
     #[serde(default)]
     pub editor: Option<String>,
+
+		#[serde(default)]
+    pub synctex: Option<String>,
 }
 
 pub enum IpcStartup {
@@ -129,7 +133,11 @@ pub fn setup_ipc(hash: u64, message: IpcMessage) -> IpcStartup {
 
 					if conn.read_to_string(&mut buf).is_ok() && !buf.is_empty() {
 						if let Ok(msg) = serde_json::from_str::<IpcMessage>(&buf) {
-							if msg.path.is_some() || msg.page.is_some() || msg.servername.is_some() || msg.editor.is_some()
+							if msg.path.is_some() 
+								|| msg.page.is_some() 
+									|| msg.servername.is_some() 
+									|| msg.editor.is_some()
+									|| msg.synctex.is_some()
 							{
 								let _ = tx.send(msg);
 							}
@@ -177,7 +185,7 @@ pub fn pdf_ipc_hash(path: &std::path::Path) -> u64 {
 }
 
 
-// 统一解析命令行参数的辅助函数
+//// 统一解析命令行参数的辅助函数
 pub fn parse_args(
     args: &[String],
 ) -> (
@@ -185,39 +193,70 @@ pub fn parse_args(
     Option<usize>,
     Option<String>,
     Option<String>,
+    Option<String>,
 ) {
     let mut pdf_path = None;
     let mut page_override = None;
     let mut servername = None;
     let mut editor = None;
+    let mut synctex: Option<String> = None;
 
     for arg in args.iter().skip(1) {
-        if let Some(value) = arg.strip_prefix("--page=") {
-            if let Ok(p) = value.parse::<usize>() {
-                page_override = Some(p.saturating_sub(1));
+        match arg.as_str() {
+            _ if arg.starts_with("--page=") => {
+                if let Some(value) = arg.strip_prefix("--page=") {
+                    if let Ok(p) = value.parse::<usize>() {
+                        page_override = Some(p.saturating_sub(1));
+                    }
+                }
             }
-        } else if let Some(value) = arg.strip_prefix("--servername=") {
-            servername = Some(value.to_string());
-        } else if let Some(value) = arg.strip_prefix("--editor=") {
-            editor = Some(value.to_string());
-        } else if !arg.starts_with("--") && pdf_path.is_none() {
-            let path = std::path::PathBuf::from(arg);
-            //pdf_path = Some(path.canonicalize().unwrap_or(path));
-            let abs_path = if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir()
-                    .map(|mut cur| {
-                        cur.push(&path);
-                        cur
-                    })
-                    .unwrap_or(path)
-            };
 
-            let final_path = abs_path.canonicalize().unwrap_or(abs_path);
-            pdf_path = Some(final_path);
+            _ if arg.starts_with("--servername=") => {
+                servername = arg
+                    .strip_prefix("--servername=")
+                    .map(|v| v.to_string());
+            }
+
+            _ if arg.starts_with("--editor=") => {
+                editor = arg
+                    .strip_prefix("--editor=")
+                    .map(|v| v.to_string());
+            }
+
+            _ if arg.starts_with("--synctex=") => {
+                synctex = arg
+                    .strip_prefix("--synctex=")
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+            }
+
+            _ if !arg.starts_with("--") && pdf_path.is_none() => {
+                let path = std::path::PathBuf::from(arg);
+
+                let abs_path = if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir()
+                        .map(|mut cur| {
+                            cur.push(&path);
+                            cur
+                        })
+                        .unwrap_or(path)
+                };
+
+                let final_path = abs_path.canonicalize().unwrap_or(abs_path);
+                pdf_path = Some(final_path);
+            }
+
+            _ => {}
         }
     }
 
-    (pdf_path, page_override, servername, editor)
+    (
+        pdf_path,
+        page_override,
+        servername,
+        editor,
+        synctex,
+    )
 }

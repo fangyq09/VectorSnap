@@ -81,6 +81,9 @@ pub struct AppConfig {
 	#[serde(default = "default_nvim_path")]
 	pub nvim_path: String,
 
+	#[serde(default)]
+	pub vim_function: Option<String>,
+
 }
 
 fn default_true() -> bool {
@@ -136,6 +139,7 @@ impl Default for AppConfig {
 			synctex_dir: String::new(),
 			nvim_socket: default_nvim_socket(),
 			nvim_path: "nvim".to_string(),
+			vim_function: None,
 		}
 	}
 }
@@ -262,6 +266,7 @@ struct PdfApp {
 		ipc_handle: Option<IpcHandle>,
 		vim_servername: Option<String>,
 		editor: Option<String>,
+		synctex: Option<String>,
 		new_ocr_name: String,
     new_ocr_model_id: String,
     new_ocr_provider: String,
@@ -482,6 +487,7 @@ impl PdfApp {
 			ipc_handle,
 			vim_servername: None,
 			editor: None,
+			synctex: None,
 			new_ocr_name: String::new(),
 			new_ocr_model_id: String::new(),
 			new_ocr_provider: "local".to_string(),
@@ -1415,6 +1421,21 @@ impl PdfApp {
 						ui.weak("Leave empty if .synctex.gz is in the same folder as PDF.");
 						ui.add_space(15.0);
 
+						// SyncTeX 之后执行vim函数
+						ui.horizontal(|ui| {
+							ui.label("Vim Function:");
+							let mut vim_function = self.config.vim_function.clone().unwrap_or_default();
+							if ui.text_edit_singleline(&mut vim_function).changed() {
+								self.config.vim_function = if vim_function.trim().is_empty() {
+									None
+								} else {
+									Some(vim_function)
+								};
+							}
+						});
+						ui.weak("Calling a vim function after SyncTeX.");
+						ui.add_space(15.0);
+
 						// 2. Neovim Socket 路径配置 ---
 						ui.horizontal(|ui| {
 							ui.label("Neovim Socket Path:");
@@ -2023,6 +2044,7 @@ impl PdfApp {
 		// ... 其他需要重置的状态
 	}
 }
+
 //PDF页面渲染
 impl PdfApp {
 	fn render_pdf_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2381,6 +2403,7 @@ impl PdfApp {
             page: Some(self.current_page),
             servername: self.vim_servername.clone(),
             editor: self.editor.clone(),
+						synctex: None,
         };
 
         match setup_ipc(hash, ipc_message) {
@@ -2412,7 +2435,18 @@ impl PdfApp {
         }
     }
 }
+// 优先解析 synctex,失败则退回直接指定的 page
 
+impl PdfApp {
+fn resolve_target_page(&self, page: Option<usize>, synctex: Option<&str>) -> Option<usize> {
+    if let (Some(query), Some(pdf_path)) = (synctex, &self.pdf_path) {
+        if let Some(p) = crate::synctex::resolve_synctex_page(pdf_path, query) {
+            return Some(p);
+        }
+    }
+    page
+}
+}
 impl PdfApp {
 fn process_ipc_messages(&mut self, ctx: &egui::Context) {
     // 1. 先取出所有待处理消息，避免借用冲突
@@ -2444,13 +2478,26 @@ fn process_ipc_messages(&mut self, ctx: &egui::Context) {
             };
         }
 
+				// 更新 Synctex Path
+				if let Some(sync) = &msg.synctex {
+					let sync = sync.trim();
+
+					self.synctex = if sync.is_empty() {
+						None
+					} else {
+						Some(sync.to_string())
+					};
+				}
+
         // 加载 PDF
         if let Some(new_path) = msg.path {
             self.load_pdf_path(new_path);
         }
 
+				// 优先 synctex,其次直接指定的 page
+        let target_page = self.resolve_target_page(msg.page, msg.synctex.as_deref());
         // 跳转到指定页码
-        if let Some(p) = msg.page {
+        if let Some(p) = target_page {
             if let Some(doc) = &self.pdf_doc {
                 if p < doc.pages().len() as usize {
                     self.current_page = p;
@@ -2458,6 +2505,16 @@ fn process_ipc_messages(&mut self, ctx: &egui::Context) {
                 }
             }
         }
+
+        //// 跳转到指定页码
+        //if let Some(p) = msg.page {
+        //    if let Some(doc) = &self.pdf_doc {
+        //        if p < doc.pages().len() as usize {
+        //            self.current_page = p;
+        //            self.texture = None;
+        //        }
+        //    }
+        //}
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
@@ -2591,13 +2648,14 @@ impl eframe::App for PdfApp {
 fn main() -> eframe::Result<()> {
     // 1. Extract command line arguments
     let args: Vec<String> = std::env::args().collect();
-		let (target_path, target_page, target_servername, target_editor) = parse_args(&args);
+		let (target_path, target_page, target_servername, target_editor, target_synctex) = parse_args(&args);
 
 		let ipc_message = IpcMessage {
         path: target_path.clone(),
         page: target_page,
         servername: target_servername.clone(),
         editor: target_editor.clone(),
+				synctex: target_synctex.clone(),
     };
 
 		let (ipc_receiver, ipc_handle) = if let Some(pdf_path) = target_path.as_ref() {
@@ -2656,15 +2714,23 @@ fn main() -> eframe::Result<()> {
             setup_fonts(&cc.egui_ctx);
 
             // Pass rx receiver into PdfApp
-						//let mut app = PdfApp::new(cc, target_path, ipc_receiver);
 						let mut app = PdfApp::new(cc, target_path, ipc_receiver, ipc_handle);
-
-            if let Some(p) = target_page {
-                app.current_page = p;
-                app.texture = None;
-            }
 						app.vim_servername = target_servername;
 						app.editor = target_editor;
+						app.synctex = target_synctex.clone();
+
+            //if let Some(p) = target_page {
+            //    app.current_page = p;
+            //    app.texture = None;
+            //}
+						let startup_page = app.resolve_target_page(target_page, target_synctex.as_deref());
+						if let Some(p) = startup_page {
+							if let Some(doc) = &app.pdf_doc {
+								let total = doc.pages().len() as usize;
+								app.current_page = p.min(total.saturating_sub(1));
+								app.texture = None;
+							}
+						}
             Ok(Box::new(app))
         }),
     )
