@@ -2,7 +2,7 @@ use std::sync::Arc;
 use base64::Engine;
 
 
-use crate::PdfApp;
+use crate::{OcrModelConfig, PdfApp};
 
 use crate::latex_preview::normalize_latex;
 
@@ -457,7 +457,17 @@ impl PdfApp {
 			return;
 		}
 
-		let model_id = self.ocr_model_name.clone();
+		// 取当前选中模型的完整配置（含 llama-mtmd-cli / gguf / mmproj 路径）
+		// 找不到时退回旧行为：仅用 model_id 按默认目录查找
+		let model_cfg = self.config.ocr_models.iter()
+			.find(|m| m.name == self.config.current_ocr_model_name)
+			.cloned()
+			.unwrap_or_else(|| OcrModelConfig {
+				model_id: self.ocr_model_name.clone(),
+				provider: "local".to_string(),
+				..Default::default()
+			});
+
 		let ocr_res = Arc::clone(&self.ocr_result);
 		let loading = Arc::clone(&self.is_ocr_loading);
 		let ctx_clone = ctx.clone();
@@ -470,30 +480,38 @@ impl PdfApp {
 		}
 
 		std::thread::spawn(move || {
-			let result = (|| -> Option<String> {
+			let result = (|| -> Result<String, String> {
 				// --- A. 图像预处理与临时保存 ---
 				let img_to_send = scale_image_for_ocr(img);
 
 				// 保存到临时文件供外部 EXE 读取
 				let temp_path = std::env::temp_dir().join("ocr_local_input.png");
-				img_to_send.save(&temp_path).ok()?;
+				img_to_send.save(&temp_path)
+					.map_err(|e| format!("无法保存临时图片: {}", e))?;
 				let img_path_str = temp_path.to_string_lossy().to_string();
 
 				// --- B. 获取本地路径与执行 ---
-				let (exe, model, mmproj) = get_ocr_paths(&model_id)?;
+				let (exe, model, mmproj) = get_ocr_paths(&model_cfg)?;
 
-				let output = std::process::Command::new(exe)
-					.arg("-m").arg(model)
+				let output = std::process::Command::new(&exe)
+					.arg("-m").arg(&model)
 					.arg("--jinja")
-					.arg("--mmproj").arg(mmproj)
+					.arg("--mmproj").arg(&mmproj)
 					.arg("--image").arg(&img_path_str)
 					.arg("--temp").arg("0.1")
 					.arg("-p").arg(prompt)
 					.arg("-n").arg("2048")
 					.arg("-c").arg("16384")
-					.output().ok()?;
+					.output()
+					.map_err(|e| format!("无法启动 {}: {}", exe.display(), e))?;
 
-				if !output.status.success() { return None; }
+				if !output.status.success() {
+					// 取 stderr 最后几行，方便定位问题
+					let err = String::from_utf8_lossy(&output.stderr);
+					let mut tail: Vec<&str> = err.lines().rev().take(5).collect();
+					tail.reverse();
+					return Err(format!("退出码 {:?}\n{}", output.status.code(), tail.join("\n")));
+				}
 
 				// --- C. 清洗输出 ---
 				let raw = String::from_utf8_lossy(&output.stdout);
@@ -501,7 +519,7 @@ impl PdfApp {
 					.filter(|line| !line.is_empty() && !line.starts_with("llama_"))
 					.collect::<Vec<_>>()
 					.join("\n");
-				Some(cleaned.trim().to_string())
+				Ok(cleaned.trim().to_string())
 			})();
 
 			// --- D. 结果回传 ---
@@ -509,40 +527,70 @@ impl PdfApp {
 				let mut res_lock = ocr_res.lock().unwrap();
 				let mut loading_lock = loading.lock().unwrap();
 
-				*res_lock = result.or_else(|| Some("OCR 运行失败".to_string()));
+				*res_lock = Some(match result {
+					Ok(text) => text,
+					Err(e) => format!("OCR 运行失败: {}", e),
+				});
 				*loading_lock = false;
 			}
 			ctx_clone.request_repaint();
 		});
 	}
 }
-fn get_ocr_paths(model_id: &str) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
-	let home = dirs::home_dir()?;
-	let data_local = dirs::data_local_dir()?;
 
-	let exe_path = {
-		let local_bin = home.join(".local/bin/llama-mtmd-cli");
-		if local_bin.exists() {
-			local_bin
-		} else {
-			std::env::current_exe().ok()?
-				.parent()?
-				.join("llama-mtmd-cli")
+// 去掉首尾空白与 Windows “复制为路径” 带来的引号
+fn clean_path(s: &str) -> &str {
+	s.trim().trim_matches('"')
+}
+
+// 解析 (llama-mtmd-cli, gguf, mmproj) 三个路径。
+// 配置里填了就用配置；没填则回退到旧的默认规则，保证老配置照常工作。
+fn get_ocr_paths(cfg: &OcrModelConfig) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf), String> {
+	use std::path::PathBuf;
+
+	// 1. llama-mtmd-cli
+	let exe_path = if !clean_path(&cfg.exe_path).is_empty() {
+		PathBuf::from(clean_path(&cfg.exe_path))
+	} else {
+		let exe_name = if cfg!(target_os = "windows") { "llama-mtmd-cli.exe" } else { "llama-mtmd-cli" };
+		let local_bin = dirs::home_dir().map(|h| h.join(".local/bin").join(exe_name));
+		match local_bin {
+			Some(p) if p.exists() => p,
+			_ => std::env::current_exe().ok()
+				.and_then(|e| e.parent().map(|d| d.join(exe_name)))
+				.ok_or_else(|| "无法定位 llama-mtmd-cli，请在设置中指定路径".to_string())?,
 		}
 	};
-
-	let model_base = data_local.join("llama_models");
-	//let model_path = model_base.join("GLM-OCR-Q8_0.gguf");
-	//let mmproj_path = model_base.join("mmproj-GLM-OCR-Q8_0.gguf");
-	let model_path = model_base.join(format!("{}.gguf", model_id));
-	let mmproj_path = model_base.join(format!("mmproj-{}.gguf", model_id));
-
-	// 只要有一个文件不存在，就返回 None
-	if !exe_path.exists() || !model_path.exists() {
-		return None;
+	if !exe_path.is_file() {
+		return Err(format!("找不到 llama-mtmd-cli: {}", exe_path.display()));
 	}
 
-	Some((exe_path, model_path, mmproj_path))
+	// 2. gguf 与 mmproj
+	let default_dir = || dirs::data_local_dir().map(|d| d.join("llama_models"));
+
+	let model_path = if !clean_path(&cfg.model_path).is_empty() {
+		PathBuf::from(clean_path(&cfg.model_path))
+	} else {
+		default_dir()
+			.ok_or_else(|| "无法定位默认模型目录".to_string())?
+			.join(format!("{}.gguf", cfg.model_id))
+	};
+	if !model_path.is_file() {
+		return Err(format!("找不到 gguf 模型文件: {}", model_path.display()));
+	}
+
+	let mmproj_path = if !clean_path(&cfg.mmproj_path).is_empty() {
+		PathBuf::from(clean_path(&cfg.mmproj_path))
+	} else {
+		default_dir()
+			.ok_or_else(|| "无法定位默认模型目录".to_string())?
+			.join(format!("mmproj-{}.gguf", cfg.model_id))
+	};
+	if !mmproj_path.is_file() {
+		return Err(format!("找不到 mmproj 文件: {}", mmproj_path.display()));
+	}
+
+	Ok((exe_path, model_path, mmproj_path))
 }
 fn scale_image_for_ocr(img: image::RgbaImage) -> image::RgbaImage {
 	let (w, h) = (img.width() as f32, img.height() as f32);

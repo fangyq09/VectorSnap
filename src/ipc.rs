@@ -1,8 +1,12 @@
 use std::path::{PathBuf};
-use std::sync::mpsc;
 use std::io::{Read, Write};
 use std::thread;
 use interprocess::local_socket::{prelude::*, ListenerOptions, Stream};
+use std::sync::{Arc, Mutex, mpsc};
+use eframe::egui;
+
+pub type Wakeup = Arc<Mutex<Option<egui::Context>>>;
+pub fn new_wakeup() -> Wakeup { Arc::new(Mutex::new(None)) }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct IpcMessage {
@@ -29,6 +33,7 @@ pub struct IpcHandle {
     stop_tx: mpsc::Sender<()>,
     thread: Option<thread::JoinHandle<()>>,
     ipc_id: String,
+		wakeup: Wakeup,
 }
 
 impl Drop for IpcHandle {
@@ -62,7 +67,14 @@ impl Drop for IpcHandle {
     }
 }
 
-pub fn setup_ipc(hash: u64, message: IpcMessage) -> IpcStartup {
+// UI 起来之后把 Context 塞进去
+impl IpcHandle {
+    pub fn attach_ctx(&self, ctx: &egui::Context) {
+        if let Ok(mut g) = self.wakeup.lock() { *g = Some(ctx.clone()); }
+    }
+}
+
+pub fn setup_ipc(hash: u64, message: IpcMessage, wakeup: Wakeup) -> IpcStartup {
 	let ipc_id = format!("vectorsnap_{:016x}", hash);
 
 	// Windows 使用命名管道名称
@@ -120,7 +132,7 @@ pub fn setup_ipc(hash: u64, message: IpcMessage) -> IpcStartup {
 	// 3. 创建消息通道和停止通道
 	let (tx, rx) = mpsc::channel::<IpcMessage>();
 	let (stop_tx, stop_rx) = mpsc::channel::<()>();
-
+	let thread_wakeup = wakeup.clone();
 	// 4. 启动监听线程
 	let thread = std::thread::spawn(move || {
 		// 只创建一次 incoming 迭代器
@@ -140,6 +152,9 @@ pub fn setup_ipc(hash: u64, message: IpcMessage) -> IpcStartup {
 									|| msg.synctex.is_some()
 							{
 								let _ = tx.send(msg);
+								if let Ok(g) = thread_wakeup.lock() {
+									if let Some(ctx) = g.as_ref() { ctx.request_repaint(); }
+								}
 							}
 						}
 					}
@@ -165,7 +180,7 @@ pub fn setup_ipc(hash: u64, message: IpcMessage) -> IpcStartup {
 	});
 
 	// 5. 保存监听线程生命周期
-	let handle = IpcHandle {stop_tx, thread: Some(thread), ipc_id};
+	let handle = IpcHandle { stop_tx, thread: Some(thread), ipc_id, wakeup };
 
 	IpcStartup::Primary(rx, handle)
 }

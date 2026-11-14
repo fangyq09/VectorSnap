@@ -2,8 +2,7 @@
 
 use eframe::egui;
 //use pdfium_render::prelude::*;
-use pdfium_render::prelude::{Pdfium, PdfDocument, PdfPageRenderRotation, PdfRenderConfig, 
-PdfPageObjectsCommon, PdfPageAnnotationCommon, PdfPageObjectType};
+use pdfium_render::prelude::{Pdfium, PdfDocument};
 use std::path::PathBuf;
 use std::collections::{HashMap};
 use std::sync::{mpsc, Arc, Mutex};
@@ -26,6 +25,8 @@ mod handwriting;
 mod export;
 mod ai_tools;
 mod ipc;
+mod view;
+mod toc;
 
 use crate::handwriting::{
     //EraseStroke,
@@ -108,13 +109,22 @@ fn default_editor_command() -> String {
     "gvim".to_string()
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 pub struct OcrModelConfig {
     pub name: String,
     pub model_id: String,
+    // "local" = 本地 llama-mtmd-cli；其他任意值 = 云端（OpenAI 风格 API）
     pub provider: String,
     pub api_token: String,
     pub api_url: String,
+
+    // ↓ 仅 provider == "local" 时使用；为空则回退到旧的默认查找规则
+    #[serde(default)]
+    pub exe_path: String,
+    #[serde(default)]
+    pub model_path: String,
+    #[serde(default)]
+    pub mmproj_path: String,
 }
 
 impl Default for AppConfig {
@@ -132,6 +142,7 @@ impl Default for AppConfig {
 					provider: "local".to_string(),
 					api_token: "".to_string(),
 					api_url: "".to_string(),
+					..Default::default()
 				},
 			],
 			current_ocr_model_name: "GLM-OCR".to_string(),
@@ -171,6 +182,13 @@ enum ShortcutAction {
 		ForceOpenEmptyOcr,
 		ScrollLeft,
 		ScrollRight,
+		ScrollUp,          // ★ 细滚
+		ScrollDown,
+		ScrollHalfUp,      // ★ 半屏
+		ScrollHalfDown,
+		ScrollFullUp,      // ★ 整屏
+		ScrollFullDown,
+		ToggleToc,
 		GotoPage(usize),
 }
 
@@ -178,6 +196,15 @@ struct CachedLink {
     rect: egui::Rect,
     destination: Option<usize>, 
     uri: Option<String>,       
+}
+
+//目录节点
+#[derive(Clone)]
+struct TocNode {
+	id: usize,                 // 构建顺序编号，用于展开状态
+	title: String,
+	page: Option<usize>,
+	children: Vec<TocNode>,
 }
 
 fn spawn_and_reap(child: std::io::Result<Child>) {
@@ -218,6 +245,8 @@ struct PdfApp {
 		show_settings_window: bool,
 		last_rendered_page: usize,
     last_rendered_angle: f32,
+		last_layout: Option<(usize, f32, egui::Vec2)>,
+		last_viewport: egui::Vec2,
 		show_export_window: bool,
 		export_range_text: String,
 		show_merge_window: bool,
@@ -264,6 +293,7 @@ struct PdfApp {
 		enable_auto_crop_dpi: bool,
 		ipc_receiver: Option<mpsc::Receiver<IpcMessage>>,
 		ipc_handle: Option<IpcHandle>,
+		ctx: egui::Context, 
 		vim_servername: Option<String>,
 		editor: Option<String>,
 		synctex: Option<String>,
@@ -272,22 +302,43 @@ struct PdfApp {
     new_ocr_provider: String,
     new_ocr_api_url: String,
     new_ocr_api_token: String,
+		new_ocr_is_local: bool,
+		new_ocr_exe_path: String,
+		new_ocr_model_path: String,
+		new_ocr_mmproj_path: String,
+		toc: Vec<TocNode>,
+		show_toc: bool,
+		toc_expanded: std::collections::HashSet<usize>,
+		toc_opened_at: f64,
+		tab_toggle_requested: bool,
 }
 
 fn load_config() -> AppConfig {
     let path = config_path();
 
-    if let Ok(data) = std::fs::read_to_string(&path) {
-        serde_json::from_str(&data).unwrap_or_default()
-    } else {
-        AppConfig::default()
+    match std::fs::read_to_string(&path) {
+        Ok(data) => match serde_json::from_str(&data) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                // 解析失败时先备份，避免下一次保存时被默认值覆盖掉用户的配置
+                eprintln!("❌ 配置解析失败 {}: {}", path.display(), e);
+                let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+                AppConfig::default()
+            }
+        },
+        Err(_) => AppConfig::default(),
     }
 }
 fn save_config(cfg: &AppConfig) {
     let path = config_path();
 
-    if let Ok(data) = serde_json::to_string_pretty(cfg) {
-        let _ = std::fs::write(path, data);
+    match serde_json::to_string_pretty(cfg) {
+        Ok(data) => {
+            if let Err(e) = std::fs::write(&path, data) {
+                eprintln!("❌ 保存配置失败 {}: {}", path.display(), e);
+            }
+        }
+        Err(e) => eprintln!("❌ 序列化配置失败: {}", e),
     }
 }
 pub fn get_config_dir() -> std::path::PathBuf {
@@ -362,7 +413,7 @@ fn extract_pdfium_to_local(path: &std::path::PathBuf) {
 //初始化
 impl PdfApp {
 	pub fn new(
-		_cc: &eframe::CreationContext<'_>, 
+		cc: &eframe::CreationContext<'_>, 
 		path: Option<std::path::PathBuf>,
 		ipc_receiver: Option<mpsc::Receiver<IpcMessage>>,
 		ipc_handle: Option<IpcHandle>,
@@ -407,6 +458,12 @@ impl PdfApp {
 				)
 			});
 
+
+		// 禁用 egui 默认的 Ctrl+加减号全局缩放功能
+		cc.egui_ctx.options_mut(|options| {
+			options.zoom_with_keyboard = false;
+		});
+
 		let mut app = Self {
 			pdfium,
 			last_applied_title: "VectorSnap".to_string(),
@@ -435,6 +492,8 @@ impl PdfApp {
 			show_settings_window: false,
 			last_rendered_page: 999999, 
 			last_rendered_angle: 0.0,
+			last_layout: None,
+			last_viewport: egui::Vec2::ZERO,
 			show_export_window: false,
 			export_range_text: "".to_string(),
 			show_merge_window: false,
@@ -485,16 +544,26 @@ impl PdfApp {
 			enable_auto_crop_dpi: initial_auto_crop_dpi,
 			ipc_receiver,
 			ipc_handle,
+			ctx: cc.egui_ctx.clone(),
 			vim_servername: None,
 			editor: None,
 			synctex: None,
 			new_ocr_name: String::new(),
 			new_ocr_model_id: String::new(),
-			new_ocr_provider: "local".to_string(),
+			new_ocr_provider: String::new(),
+			new_ocr_is_local: true,
+			new_ocr_exe_path: String::new(),
+			new_ocr_model_path: String::new(),
+			new_ocr_mmproj_path: String::new(),
 			new_ocr_api_url: String::new(),
 			new_ocr_api_token: String::new(),
+			toc: Vec::new(),
+			show_toc: false,
+			toc_expanded: std::collections::HashSet::new(),
+			toc_opened_at: 0.0,
+			tab_toggle_requested: false,
 		};
-
+		if let Some(h) = &app.ipc_handle { h.attach_ctx(&cc.egui_ctx); }
 		// 如果启动参数里有路径，直接调用加载函数
 		if let Some(p) = path {
 			app.load_pdf_path(p);
@@ -545,6 +614,7 @@ impl PdfApp {
 		// 1. 获取当前焦点状态
 		// 如果用户正在 TextEdit 中打字，has_focus 为 true
 		let has_focus = ctx.memory(|mem| mem.focused().is_some());
+		//let latex_focused = ctx.memory(|mem| mem.has_focus(egui::Id::new("latex_input_field")));
 
 		let current_time = ctx.input(|i| i.time);
 		// 如果距离上次按 g 超过 1.0 秒，自动重置 pending 状态
@@ -561,6 +631,18 @@ impl PdfApp {
 				action = ShortcutAction::ClosePreview;
 				return; 
 			}
+
+			// Tab 显示目录(Toc)窗口
+			//if !latex_focused {
+			//	// Shift+Tab 也一起吞掉，杜绝反向焦点循环
+			//	if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab) {
+			//		return;
+			//	}
+			//	if i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+			//		action = ShortcutAction::ToggleToc;
+			//		return;
+			//	}
+			//}
 
 			// Ctrl + S 始终允许保存截图
 			if i.modifiers.ctrl && i.key_pressed(egui::Key::S) {
@@ -612,6 +694,19 @@ impl PdfApp {
 			// 这样按 J/K 就不会翻页，Ctrl+C 也会由 TextEdit 自己处理
 			if has_focus {
 				return; 
+			}
+
+			// ---------- 统一前缀清理：任何非 [0-9] / 非 g 的按键，都终止 count 前缀 ----------
+			let non_prefix_key = i.events.iter().any(|e| match e {
+				egui::Event::Key { key, pressed: true, .. } => !matches!(key,
+					egui::Key::Num0 | egui::Key::Num1 | egui::Key::Num2 | egui::Key::Num3 |
+					egui::Key::Num4 | egui::Key::Num5 | egui::Key::Num6 | egui::Key::Num7 |
+					egui::Key::Num8 | egui::Key::Num9 | egui::Key::G),
+				_ => false,
+			});
+			if non_prefix_key || i.pointer.any_pressed() {
+				self.goto_buffer.clear();
+				self.pending_g = false;
 			}
 
 			// ---------- 第三优先级：仅在非输入状态下的快捷键 ----------
@@ -752,12 +847,39 @@ impl PdfApp {
 				}
 			}
 
+			// 上下细滚：裸 u / d
+			if i.consume_key(egui::Modifiers::NONE, egui::Key::D) {
+				action = ShortcutAction::ScrollDown; return;
+			}
+			if i.consume_key(egui::Modifiers::NONE, egui::Key::U) {
+				action = ShortcutAction::ScrollUp; return;
+			}
+			// 半屏：Ctrl+D / Ctrl+U
+			if i.consume_key(egui::Modifiers::CTRL, egui::Key::D) {
+				action = ShortcutAction::ScrollHalfDown; return;
+			}
+			if i.consume_key(egui::Modifiers::CTRL, egui::Key::U) {
+				action = ShortcutAction::ScrollHalfUp; return;
+			}
+			// 整屏： Ctrl+F / Ctrl+B
+			if i.consume_key(egui::Modifiers::CTRL, egui::Key::B) {
+				action = ShortcutAction::ScrollFullUp; return;
+			}
+			if i.consume_key(egui::Modifiers::CTRL, egui::Key::F) {
+				action = ShortcutAction::ScrollFullDown; return;
+			}
+
+
 			// 退出程序快捷键 Q
 			if i.consume_key(egui::Modifiers::NONE, egui::Key::Q) {
 				action = ShortcutAction::ResetApp;
 				return; 
 			}
 		});
+
+		if std::mem::take(&mut self.tab_toggle_requested) {
+			action = ShortcutAction::ToggleToc;
+		}
 
 		let scroll_step = 40.0;  // 滚动步长
 		match action {
@@ -836,7 +958,9 @@ impl PdfApp {
 			}
 
 			ShortcutAction::ClosePreview => {
-				if self.show_preview_window {
+				if self.show_toc {
+					self.show_toc = false;
+				} else if self.show_preview_window {
 					self.show_preview_window = false;
 					//self.preview_texture = None;
 				} else if self.show_ocr_window {
@@ -890,8 +1014,24 @@ impl PdfApp {
 				ctx.request_repaint(); // 强制重绘以显示初始欢迎界面
 			}
 
-			ShortcutAction::ScrollLeft => { self.scroll_delta.x -= scroll_step; }
-			ShortcutAction::ScrollRight => { self.scroll_delta.x += scroll_step; }
+			ShortcutAction::ScrollLeft => { self.scroll_delta.x += scroll_step; }
+			ShortcutAction::ScrollRight => { self.scroll_delta.x -= scroll_step; }
+			ShortcutAction::ScrollUp       => { self.scroll_delta.y += scroll_step; }
+			ShortcutAction::ScrollDown     => { self.scroll_delta.y -= scroll_step; }
+			ShortcutAction::ScrollHalfUp   => { self.scroll_delta.y += self.last_viewport.y.max(200.0) * 0.5; }
+			ShortcutAction::ScrollHalfDown => { self.scroll_delta.y -= self.last_viewport.y.max(200.0) * 0.5; }
+			ShortcutAction::ScrollFullUp   => { self.scroll_delta.y += self.last_viewport.y.max(200.0) * 0.9; }
+			ShortcutAction::ScrollFullDown => { self.scroll_delta.y -= self.last_viewport.y.max(200.0) * 0.9; }
+
+			ShortcutAction::ToggleToc => { 
+				self.show_toc = !self.show_toc; 
+				if self.show_toc {
+					self.toc_opened_at = ctx.input(|i| i.time);  
+				}
+				ctx.memory_mut(|mem| {
+					if let Some(id) = mem.focused() { mem.surrender_focus(id); }
+				});
+			}
 
 			ShortcutAction::None => {}
 		}
@@ -1316,7 +1456,7 @@ impl PdfApp {
                                 .spacing([40.0, 10.0])
                                 .show(ui, |ui| {
                                     ui.label("上一页/下一页 (Prev/Next)");
-                                    ui.label("↑ / ↓  or  K / J");
+                                    ui.label("Up / Down  or  K / J");
                                     ui.end_row();
 
                                     ui.label("前10页/后10页 (Prev 10/Next 10)");
@@ -1324,12 +1464,20 @@ impl PdfApp {
                                     ui.end_row();
 
                                     ui.label("首页 (First page)");
-                                    ui.label("0 or ^");
+                                    ui.label("gg");
                                     ui.end_row();
 
                                     ui.label("末页 (Last page)");
                                     ui.label("G");
                                     ui.end_row();
+
+                                    ui.label("转跳到第N页 (Go to page N)");
+                                    ui.label("Ngg");
+                                    ui.end_row();
+
+																		ui.label("上下滚动 (Scroll)");
+																		ui.label("U/D 细滚 · Ctrl+D/U 半屏 · Ctrl+F/B 整屏");
+																		ui.end_row();
 
                                     ui.label("放大/缩小 (Zoom)");
                                     ui.label("Ctrl + [ + / - ]");
@@ -1349,6 +1497,10 @@ impl PdfApp {
 
                                     ui.label("取消截图 (Cancel)");
                                     ui.label("ESC");
+                                    ui.end_row();
+
+                                    ui.label("显示目录 (Toc)");
+                                    ui.label("Tab");
                                     ui.end_row();
 
                                     ui.label("回到欢迎界面 (Back to Home)");
@@ -1375,6 +1527,42 @@ impl PdfApp {
     }
 }
 //设置窗口
+// 设置窗口：一行 “标签 + 路径输入框 + 浏览按钮 + 状态”
+// exts 为空表示不过滤；hint 为空表示该项必填（缺失时显示 ⚠）
+fn ocr_path_row(ui: &mut egui::Ui, label: &str, value: &mut String, exts: &[&str], hint: &str) {
+	ui.horizontal(|ui| {
+		ui.label(label);
+		let width = (ui.available_width() - 110.0).max(100.0);
+		ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(width));
+
+		if ui.button("📂").on_hover_text("Browse...").clicked() {
+			let mut dialog = rfd::FileDialog::new();
+			if !exts.is_empty() {
+				dialog = dialog.add_filter("Model file", exts);
+			}
+			if let Some(dir) = std::path::Path::new(value.trim()).parent() {
+				if dir.is_dir() {
+					dialog = dialog.set_directory(dir);
+				}
+			}
+			if let Some(p) = dialog.pick_file() {
+				*value = p.to_string_lossy().to_string();
+			}
+		}
+
+		let v = value.trim().trim_matches('"');
+		if v.is_empty() {
+			if hint.is_empty() {
+				ui.colored_label(egui::Color32::YELLOW, "⚠");
+			}
+		} else if std::path::Path::new(v).is_file() {
+			ui.colored_label(egui::Color32::GREEN, "✔");
+		} else {
+			ui.colored_label(egui::Color32::LIGHT_RED, "✘");
+		}
+	});
+}
+
 impl PdfApp {
 	fn render_settings_window(&mut self, ctx: &egui::Context) {
 		let mut is_open = self.show_settings_window;
@@ -1482,24 +1670,49 @@ impl PdfApp {
 
 						let mut model_to_remove = None;
 						for (idx, model) in self.config.ocr_models.iter().enumerate() {
+							let is_local = model.provider == "local";
+							let or_default = |s: &str, d: String| if s.trim().is_empty() { d } else { s.trim().to_string() };
 							ui.group(|ui| {
 								ui.horizontal(|ui| {
 									ui.strong(&model.name);
-									ui.weak(format!("({} / {})", model.provider, model.model_id));
+									if is_local {
+										ui.weak("💻 Local");
+									} else {
+										ui.weak(format!("☁ Cloud ({})", model.provider));
+									}
 									ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
 										if ui.button("🗑 Delete").clicked() {
 											model_to_remove = Some(idx);
 										}
 									});
 								});
-								ui.label(format!("API URL: {}", model.api_url));
+								if is_local {
+									ui.label(format!("CLI: {}", or_default(&model.exe_path, "(auto-detect)".to_string())));
+									ui.label(format!("GGUF: {}", or_default(&model.model_path, format!("{}.gguf (default folder)", model.model_id))));
+									ui.label(format!("mmproj: {}", or_default(&model.mmproj_path, format!("mmproj-{}.gguf (default folder)", model.model_id))));
+								} else {
+									ui.label(format!("Model: {}", model.model_id));
+									ui.label(format!("API URL: {}", model.api_url));
+								}
 							});
 							ui.add_space(4.0);
 						}
 
 						// 执行删除
 						if let Some(idx) = model_to_remove {
-							self.config.ocr_models.remove(idx);
+							let removed = self.config.ocr_models.remove(idx);
+
+							// 删的是当前正在使用的模型：切换到剩余的第一个，否则 ocr_* 仍是旧模型的值
+							if removed.name == self.config.current_ocr_model_name {
+								let next = self.config.ocr_models.first().cloned().unwrap_or_default();
+								self.config.current_ocr_model_name = next.name.clone();
+								self.ocr_model_name = next.model_id.clone();
+								self.ocr_api_token = next.api_token.clone();
+								self.ocr_api_url = next.api_url.clone();
+								self.ocr_provider = next.provider.clone();
+							}
+
+							self.save_all_config(); // 立即写入 config.json
 						}
 
 						ui.add_space(10.0);
@@ -1507,43 +1720,100 @@ impl PdfApp {
 						ui.add_space(5.0);
 
 						ui.horizontal(|ui| {
+							ui.label("Type:");
+							ui.selectable_value(&mut self.new_ocr_is_local, false, "☁ Cloud");
+							ui.selectable_value(&mut self.new_ocr_is_local, true, "💻 Local");
+						});
+						ui.horizontal(|ui| {
 							ui.label("Name:");
 							ui.text_edit_singleline(&mut self.new_ocr_name);
 						});
-						ui.horizontal(|ui| {
-							ui.label("Model ID:");
-							ui.text_edit_singleline(&mut self.new_ocr_model_id);
-						});
-						ui.horizontal(|ui| {
-							ui.label("Provider:");
-							ui.text_edit_singleline(&mut self.new_ocr_provider);
-						});
-						ui.horizontal(|ui| {
-							ui.label("API URL:");
-							ui.text_edit_singleline(&mut self.new_ocr_api_url);
-						});
-						ui.horizontal(|ui| {
-							ui.label("API Token:");
-							ui.text_edit_singleline(&mut self.new_ocr_api_token);
-						});
+
+						if self.new_ocr_is_local {
+							// 本地：llama-mtmd-cli + gguf + mmproj
+							ocr_path_row(ui, "llama-mtmd-cli:", &mut self.new_ocr_exe_path, &[], "empty = auto-detect");
+							ocr_path_row(ui, "GGUF model:", &mut self.new_ocr_model_path, &["gguf"], "");
+							ocr_path_row(ui, "mmproj:", &mut self.new_ocr_mmproj_path, &["gguf"], "");
+						} else {
+							// 云端：OpenAI 风格接口
+							ui.horizontal(|ui| {
+								ui.label("Model ID:");
+								ui.text_edit_singleline(&mut self.new_ocr_model_id);
+							});
+							ui.horizontal(|ui| {
+								ui.label("Provider:");
+								ui.add(egui::TextEdit::singleline(&mut self.new_ocr_provider).hint_text("label only, e.g. openai"));
+							});
+							ui.horizontal(|ui| {
+								ui.label("API URL:");
+								ui.text_edit_singleline(&mut self.new_ocr_api_url);
+							});
+							ui.horizontal(|ui| {
+								ui.label("API Token:");
+								ui.text_edit_singleline(&mut self.new_ocr_api_token);
+							});
+						}
+
+						// ---- 校验 ----
+						let clean = |s: &str| s.trim().trim_matches('"').to_string();
+						let new_name = self.new_ocr_name.trim().to_string();
+						let name_taken = self.config.ocr_models.iter().any(|m| m.name == new_name);
+						let inputs_ok = if self.new_ocr_is_local {
+							let exe = clean(&self.new_ocr_exe_path);
+							std::path::Path::new(&clean(&self.new_ocr_model_path)).is_file()
+								&& std::path::Path::new(&clean(&self.new_ocr_mmproj_path)).is_file()
+								&& (exe.is_empty() || std::path::Path::new(&exe).is_file())
+						} else {
+							!self.new_ocr_model_id.trim().is_empty() && !self.new_ocr_api_url.trim().is_empty()
+						};
+						if name_taken {
+							ui.colored_label(egui::Color32::LIGHT_RED, "⚠ A model with this name already exists");
+						}
 
 						ui.add_space(5.0);
-						if ui.button("Add to List").clicked() {
-							if !self.new_ocr_name.is_empty() && !self.new_ocr_model_id.is_empty() {
-								self.config.ocr_models.push(OcrModelConfig {
-									name: self.new_ocr_name.clone(),
-									model_id: self.new_ocr_model_id.clone(),
-									provider: if self.new_ocr_provider.is_empty() { "local".to_string() } else { self.new_ocr_provider.clone() },
-									api_token: self.new_ocr_api_token.clone(),
-									api_url: self.new_ocr_api_url.clone(),
-								});
-								// 清空输入框以便继续添加
-								self.new_ocr_name.clear();
-								self.new_ocr_model_id.clear();
-								self.new_ocr_provider.clear();
-								self.new_ocr_api_url.clear();
-								self.new_ocr_api_token.clear();
-							}
+						let can_add = !new_name.is_empty() && !name_taken && inputs_ok;
+						if ui.add_enabled(can_add, egui::Button::new("Add to List")).clicked() {
+							let new_model = if self.new_ocr_is_local {
+								let model_path = clean(&self.new_ocr_model_path);
+								OcrModelConfig {
+									name: new_name,
+									model_id: std::path::Path::new(&model_path)
+										.file_stem()
+										.map(|s| s.to_string_lossy().to_string())
+										.unwrap_or_default(),
+									provider: "local".to_string(),
+									exe_path: clean(&self.new_ocr_exe_path),
+									model_path,
+									mmproj_path: clean(&self.new_ocr_mmproj_path),
+									..Default::default()
+								}
+							} else {
+								let provider = self.new_ocr_provider.trim();
+								OcrModelConfig {
+									name: new_name,
+									model_id: self.new_ocr_model_id.trim().to_string(),
+									provider: if provider.is_empty() || provider.eq_ignore_ascii_case("local") {
+										"cloud".to_string()
+									} else {
+										provider.to_string()
+									},
+									api_token: self.new_ocr_api_token.trim().to_string(),
+									api_url: self.new_ocr_api_url.trim().to_string(),
+									..Default::default()
+								}
+							};
+							self.config.ocr_models.push(new_model);
+							self.save_all_config(); // 立即写入 config.json
+
+							// 清空输入框以便继续添加（Type 保持不变）
+							self.new_ocr_name.clear();
+							self.new_ocr_model_id.clear();
+							self.new_ocr_provider.clear();
+							self.new_ocr_api_url.clear();
+							self.new_ocr_api_token.clear();
+							self.new_ocr_exe_path.clear();
+							self.new_ocr_model_path.clear();
+							self.new_ocr_mmproj_path.clear();
 						}
 
 						ui.add_space(20.0);
@@ -1941,6 +2211,7 @@ impl PdfApp {
 					self.current_page = page_count.saturating_sub(1);
 				}
 				self.rotations = vec![0.0; page_count];
+				self.build_toc();
 				self.texture = None;
 
 				//if let Some(doc_ref) = &self.pdf_doc {
@@ -2041,347 +2312,10 @@ impl PdfApp {
 		self.zoom_factor = 1.0;
 		self.last_cropped_image = None;
 		self.cropped_tex = None;
+		self.toc.clear();
+		self.toc_expanded.clear();
 		// ... 其他需要重置的状态
 	}
-}
-
-//PDF页面渲染
-impl PdfApp {
-	fn render_pdf_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-		// ---------- 1. 安全检查 ----------
-		let Some(doc) = self.pdf_doc.as_ref() else { return; };
-		let total_pages_count = doc.pages().len() as usize;
-		let Ok(page) = doc.pages().get(self.current_page as u16) else { return; };
-
-		// 根据当前页面是否包含矢量对象设置截图 DPI
-		if self.enable_auto_crop_dpi {
-			self.target_dpi = if check_page_has_vector(&page) { 400.0 } else { 200.0 };
-		}
-
-		// ---------- 2. PDF 页面原始尺寸 ----------
-		let native_width = page.width().value;
-		let native_height = page.height().value;
-
-		// ---------- 3. 页面旋转 ----------
-		let angle = self.rotations.get(self.current_page).copied().unwrap_or(0.0);
-		let is_sideways = ((angle / 90.0).round() as i32).abs() % 2 != 0;
-		let aspect_ratio = if is_sideways {
-			native_height / native_width
-		} else {
-			native_width / native_height
-		};
-
-		// ---------- 4. DPI ----------
-		let ppp = ctx.pixels_per_point();
-
-		// ---------- 5. 屏幕像素计算 ----------
-		let available_rect = ui.available_rect_before_wrap();
-		let base_width = available_rect.width();
-
-		let ideal_screen_px = base_width * self.zoom_factor * ppp;
-		let screen_px_width = ideal_screen_px.round();
-		let screen_px_height = (screen_px_width / aspect_ratio).round();
-
-		let display_width = screen_px_width / ppp;
-		let display_height = screen_px_height / ppp;
-		let display_size = egui::vec2(display_width, display_height);
-
-		// ---------- 6. Oversample ----------
-		let mut target_px_width = (screen_px_width * self.view_scale).round() as u32;
-		const MAX_TEXTURE_SIZE: u32 = 8192;
-		target_px_width = target_px_width.min(MAX_TEXTURE_SIZE);
-
-		// ---------- 7. 是否需要重新渲染 ----------
-		let needs_re_render = self.texture.as_ref().map_or(true, |tex| {
-			let current_tex_width = tex.size()[0] as u32;
-			let page_changed = self.last_rendered_page != self.current_page;
-			let angle_changed = (self.last_rendered_angle - angle).abs() > 0.1;
-			let width_diff = (current_tex_width as i32 - target_px_width as i32).abs();
-			let size_changed = width_diff > 3;
-			page_changed || angle_changed || size_changed
-		});
-
-		// ---------- 9. 重新渲染 ----------
-		if needs_re_render && target_px_width > 0 {
-			let rotation = match ((angle / 90.0).round() as i32) % 4 {
-				1 | -3 => PdfPageRenderRotation::Degrees90,
-				2 | -2 => PdfPageRenderRotation::Degrees180,
-				3 | -1 => PdfPageRenderRotation::Degrees270,
-				_ => PdfPageRenderRotation::None,
-			};
-
-			let render_config = PdfRenderConfig::new()
-				.set_target_width(target_px_width as i32)
-				.rotate(rotation, true);
-
-			if let Ok(bitmap) = page.render_with_config(&render_config) {
-				let image = bitmap.as_image().to_rgba8();
-				let color_image = egui::ColorImage::from_rgba_unmultiplied(
-					[bitmap.width() as usize, bitmap.height() as usize],
-					image.as_raw(),
-				);
-
-				self.texture = Some(ctx.load_texture(
-						"pdf_page",
-						color_image,
-						egui::TextureOptions::LINEAR,
-				));
-
-				self.last_rendered_page = self.current_page;
-				self.last_rendered_angle = angle;
-			}
-		}
-
-		// ---------- 11. 绘制 ----------
-		self.paint_pdf_surface(
-			ui, 
-			ctx, 
-			&page, 
-			display_size, 
-			(native_width, native_height), 
-			angle, 
-			total_pages_count
-		);
-	}
-}
-impl PdfApp {
-	fn paint_pdf_surface(
-		&mut self,
-		ui: &mut egui::Ui,
-		ctx: &egui::Context,
-		page: &pdfium_render::prelude::PdfPage,
-		display_size: egui::Vec2,
-		native_size: (f32, f32), // (width, height)
-		angle: f32,
-		total_pages: usize,
-	) {
-		let (native_width, native_height) = native_size;
-
-		let scroll_source = if self.is_edit_mode {
-			egui::scroll_area::ScrollSource {
-				scroll_bar: true,
-				drag: false, 
-				mouse_wheel: true,
-			}
-		} else {
-			egui::scroll_area::ScrollSource::ALL
-		};
-
-		egui::ScrollArea::both()
-			.auto_shrink([false; 2])
-			.scroll_source(scroll_source)
-			.show(ui, |ui| {
-				if self.scroll_delta != egui::Vec2::ZERO {
-					ui.scroll_with_delta(self.scroll_delta);
-					self.scroll_delta = egui::Vec2::ZERO;
-				}
-
-				let available_width = ui.available_width();
-				let is_overflowing = display_size.x > available_width;
-
-				// 1. 偏移与缩放检测逻辑 
-				let x_offset = if !is_overflowing { (available_width - display_size.x) / 2.0 } else { 0.0 };
-
-				if is_overflowing && self.last_pdf_width <= available_width 
-					&& self.last_pdf_width != display_size.x {
-						ui.scroll_with_delta(egui::vec2(-100.0, 0.0));
-				}
-
-				let content_size = egui::vec2(available_width.max(display_size.x), display_size.y);
-				let (outer_rect, _) = ui.allocate_at_least(content_size, egui::Sense::hover());
-
-				let pdf_rect = egui::Rect::from_min_size(
-					egui::pos2(outer_rect.min.x + x_offset, outer_rect.min.y),
-					display_size
-				);
-
-				// 2. 像素对齐
-				let ppp = ui.ctx().pixels_per_point();
-				let aligned_rect = egui::Rect::from_min_size(
-					egui::pos2((pdf_rect.min.x * ppp).round() / ppp, (pdf_rect.min.y * ppp).round() / ppp),
-					display_size
-				);
-
-				self.last_pdf_width = aligned_rect.width();
-				self.last_pdf_height = aligned_rect.height();
-
-				let painter = ui.painter_at(aligned_rect);
-				if let Some(tex) = &self.texture {
-					painter.image(tex.id(), aligned_rect,
-					egui::Rect::from_min_max(egui::pos2(0.0, 0.0),
-					egui::pos2(1.0, 1.0)), 
-					egui::Color32::WHITE);
-				}
-
-				self.paint_static_annotations(ui, aligned_rect);
-
-				if self.is_edit_mode {
-					self.handle_edit_mode(ui, aligned_rect);
-				} else {
-
-					// 3. 交互响应
-					//let mut response = ui.interact(aligned_rect, 
-					//	ui.id().with("pdf_surf"), 
-					//	egui::Sense::click_and_drag());
-					//response.rect = aligned_rect;
-					let response = ui.interact(
-						aligned_rect, 
-						ui.id().with("pdf_surf"), 
-						egui::Sense::click_and_drag()
-					);
-
-					// --- 业务集成 ---
-					if response.clicked() && ui.input(|i| i.modifiers.ctrl) {
-						if let Some(pos) = response.interact_pointer_pos() { self.sync_to_latex(pos, aligned_rect); }
-					}
-
-					// --- 更新链接缓存 ---
-					let page_changed = self.last_link_page != Some(self.current_page);
-					let rect_changed = if let Some(last) = self.last_link_rect {
-						(last.min.x - aligned_rect.min.x).abs() > 0.1 || (last.min.y - aligned_rect.min.y).abs() > 0.1
-					} else { true };
-
-					if page_changed || rect_changed {
-						self.update_link_cache(&page, aligned_rect, native_width, native_height);
-						self.last_link_page = Some(self.current_page);
-						self.last_link_rect = Some(aligned_rect);
-					}
-
-
-					if angle == 0.0 && self.handle_link_interaction(ctx, &response, total_pages) {
-						ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-					}
-					self.handle_selection_interaction(&response, &painter, ctx, page);
-				}
-			});
-	}
-}
-//超链接
-impl PdfApp {
-	// 核心函数 A：更新缓存（仅在页面/尺寸变化时调用）
-	fn update_link_cache(
-		&mut self,
-		page: &pdfium_render::prelude::PdfPage,
-		display_rect: egui::Rect,
-		native_width: f32,
-		native_height: f32,
-	) {
-		self.link_cache.clear();
-		// 关键：在这里更新对比值
-		self.last_link_rect = Some(display_rect);
-		// 获取页面的实际裁剪框 (CropBox)
-		// 这是解决出版商 PDF 偏移的关键：找到 (0,0) 点相对于可视区域的真正位置
-		let boundaries = page.boundaries();
-		let (crop_left, crop_bottom) = if let Ok(crop) = boundaries.crop().as_ref() {
-			(crop.bounds.left().value, crop.bounds.bottom().value)
-		} else {
-			(0.0, 0.0) // Fallback if no crop box is defined
-		};
-
-		let scale_x = display_rect.width() / native_width;
-		let scale_y = display_rect.height() / native_height;
-
-		for annot in page.annotations().iter() {
-			if let Some(link_annot) = annot.as_link_annotation() {
-				if let Ok(bounds) = annot.bounds() {
-					// 减去裁剪框的偏移量
-					// bounds.left() 是相对于 MediaBox 的，我们需要相对于 CropBox 的
-					let adjusted_left = bounds.left().value - crop_left;
-					let adjusted_right = bounds.right().value - crop_left;
-					let adjusted_bottom = bounds.bottom().value - crop_bottom;
-					let adjusted_top = bounds.top().value - crop_bottom;
-
-					let x_min = display_rect.min.x + (adjusted_left * scale_x);
-					let x_max = display_rect.min.x + (adjusted_right * scale_x);
-
-					// 3. Y 轴翻转逻辑：
-					// 用 native_height (可视高度) 减去相对于可视底部的 top 值
-					let y_min = display_rect.min.y + (native_height - adjusted_top) * scale_y;
-					let y_max = display_rect.min.y + (native_height - adjusted_bottom) * scale_y;
-
-					let screen_rect = egui::Rect::from_min_max(
-						egui::pos2(x_min, y_min),
-						egui::pos2(x_max, y_max),
-					);
-
-					let mut dest_idx = None;
-					let mut uri_str = None;
-
-					if let Ok(link_data) = link_annot.link() {
-						if let Some(dest) = link_data.destination() {
-							dest_idx = dest.page_index().ok().map(|i| i as usize);
-						} else if let Some(action) = link_data.action() {
-							match action {
-								pdfium_render::prelude::PdfAction::LocalDestination(goto) => {
-									if let Ok(dest) = goto.destination() {
-										dest_idx = dest.page_index().ok().map(|i| i as usize);
-									}
-								}
-								pdfium_render::prelude::PdfAction::Uri(uri_action) => {
-									uri_str = uri_action.uri().ok();
-								}
-								_ => {}
-							}
-						}
-					}
-
-					self.link_cache.push(CachedLink {
-						rect: screen_rect,
-						destination: dest_idx,
-						uri: uri_str,
-					});
-
-				}
-			}
-		}
-	}
-
-	// 核心函数 B：处理交互（每一帧在 UI 闭包内调用）
-	fn handle_link_interaction(
-		&mut self,
-		ctx: &egui::Context,
-		response: &egui::Response,
-		total_pages: usize,
-	) -> bool {
-		let Some(mouse_pos) = ctx.input(|i| i.pointer.hover_pos()) else { return false; };
-		let mut is_over_any_link = false;
-
-		// 遍历缓存好的链接
-		for link in &self.link_cache {
-			if link.rect.contains(mouse_pos) {
-				is_over_any_link = true;
-
-				if response.clicked() {
-					if let Some(target_page) = link.destination {
-						let new_page = target_page.min(total_pages.saturating_sub(1));
-						self.current_page = new_page;
-						self.texture = None; // 触发重新渲染
-						ctx.request_repaint();
-					} else if let Some(uri) = &link.uri {
-						ctx.open_url(egui::OpenUrl::new_tab(uri));
-					}
-					break; // 已经处理了点击，跳出循环
-				}
-			}
-		}
-		is_over_any_link
-	}
-}
-// 检测页面是否包含矢量对象
-fn check_page_has_vector(
-    page: &pdfium_render::prelude::PdfPage,
-) -> bool {
-    let objects = page.objects();
-
-    for obj in objects.iter() {
-        match obj.object_type() {
-            PdfPageObjectType::Path
-            | PdfPageObjectType::Text => return true,
-            _ => {}
-        }
-    }
-
-    false
 }
 
 // 尝试为当前要加载的 PDF 注册/连接 IPC 管道
@@ -2406,7 +2340,7 @@ impl PdfApp {
 						synctex: None,
         };
 
-        match setup_ipc(hash, ipc_message) {
+        match setup_ipc(hash, ipc_message, crate::ipc::new_wakeup()) {
             IpcStartup::Exit => {
                 // 如果是冷启动时加载冲突，直接退出进程避免多余窗口
                 #[cfg(not(target_os = "windows"))]
@@ -2416,6 +2350,7 @@ impl PdfApp {
                 false
             }
 						IpcStartup::Primary(rx, handle) => {
+							handle.attach_ctx(&self.ctx); 
 							self.ipc_receiver = Some(rx);
 							self.ipc_handle = Some(handle);
 							true
@@ -2563,6 +2498,7 @@ impl eframe::App for PdfApp {
 		self.handle_main_window_drag_drop(ctx);
 		// 1. 顶部面板
 		self.render_top_panel(ctx);
+		self.render_toc_panel(ctx);
 
 		// 2. 中央 PDF 显示区域
 		egui::CentralPanel::default().show(ctx, |ui| {
@@ -2642,6 +2578,34 @@ impl eframe::App for PdfApp {
 		#[cfg(not(target_os = "windows"))]
 		self.cleanup_ipc_socket();
 	}
+	fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    // LaTeX 输入框有焦点时，保留 Tab 的正常行为
+    let latex_focused = ctx.memory(|m| m.has_focus(egui::Id::new("latex_input_field")));
+    //if latex_focused || self.show_ocr_window {
+    //    return;
+    //}
+    if latex_focused {
+        return;
+    }
+
+    let mut toggle = false;
+    raw_input.events.retain(|e| match e {
+        egui::Event::Key { key: egui::Key::Tab, pressed, modifiers, .. }
+            if !modifiers.ctrl && !modifiers.alt && !modifiers.command =>
+        {
+            // 只有 Tab 按下（非 Shift）才触发目录，Shift+Tab 直接吞掉
+            if *pressed && !modifiers.shift {
+                toggle = true;
+            }
+            false // 从事件流里删掉，egui 就不会做焦点切换
+        }
+        _ => true,
+    });
+
+    if toggle {
+        self.tab_toggle_requested = true;
+    }
+}
 }
 
 //main函数
@@ -2660,7 +2624,7 @@ fn main() -> eframe::Result<()> {
 
 		let (ipc_receiver, ipc_handle) = if let Some(pdf_path) = target_path.as_ref() {
         let hash = pdf_ipc_hash(pdf_path);
-        match setup_ipc(hash, ipc_message) {
+        match setup_ipc(hash, ipc_message, crate::ipc::new_wakeup()) {
             IpcStartup::Exit => { return Ok(()); }
 
             IpcStartup::Primary(rx, handle) => { (Some(rx), Some(handle)) }
