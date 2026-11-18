@@ -49,6 +49,8 @@ const PDFIUM_LIB_BYTES: &[u8] = include_bytes!("../assets/libpdfium.so");
 #[cfg(target_os = "windows")]
 const PDFIUM_LIB_BYTES: &[u8] = include_bytes!("../assets/pdfium.dll");
 
+const NAV_MAX: usize = 500;
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct AppConfig {
 	#[serde(default = "default_true")]
@@ -155,14 +157,35 @@ impl Default for AppConfig {
 	}
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct ViewMark {
+	pub path: PathBuf,
+	pub page: usize,
+	pub zoom: f32,
+	pub scroll: [f32; 2],
+	pub rotation: f32,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct AppHistory {
     pub last_pages: HashMap<String, usize>,
 
 		#[serde(default)]
     pub order: Vec<String>,
-}
 
+		#[serde(default)]
+		pub marks: HashMap<u8, ViewMark>,
+}
+const MARK_SET_KEYS: [egui::Key; 9] = [
+	egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
+	egui::Key::Num4, egui::Key::Num5, egui::Key::Num6,
+	egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+];
+const MARK_JUMP_KEYS: [egui::Key; 9] = [
+	egui::Key::F1, egui::Key::F2, egui::Key::F3,
+	egui::Key::F4, egui::Key::F5, egui::Key::F6,
+	egui::Key::F7, egui::Key::F8, egui::Key::F9,
+];
 enum ShortcutAction {
     None,
     PrevPage,
@@ -190,6 +213,10 @@ enum ShortcutAction {
 		ScrollFullDown,
 		ToggleToc,
 		GotoPage(usize),
+		SetMark(u8),
+		JumpMark(u8),
+		NavBack,
+		NavForward,
 }
 
 struct CachedLink {
@@ -311,6 +338,11 @@ struct PdfApp {
 		toc_expanded: std::collections::HashSet<usize>,
 		toc_opened_at: f64,
 		tab_toggle_requested: bool,
+		cur_scroll_offset: egui::Vec2,
+		pending_scroll: Option<egui::Vec2>,
+		mark_msg: Option<(String, f64)>, 
+		nav_history: Vec<ViewMark>,
+		nav_pos: usize,
 }
 
 fn load_config() -> AppConfig {
@@ -562,6 +594,11 @@ impl PdfApp {
 			toc_expanded: std::collections::HashSet::new(),
 			toc_opened_at: 0.0,
 			tab_toggle_requested: false,
+			cur_scroll_offset: egui::Vec2::ZERO,
+			pending_scroll: None,
+			mark_msg: None,
+			nav_history: Vec::new(),
+			nav_pos: 0,
 		};
 		if let Some(h) = &app.ipc_handle { h.attach_ctx(&cc.egui_ctx); }
 		// 如果启动参数里有路径，直接调用加载函数
@@ -686,6 +723,18 @@ impl PdfApp {
 				i.consume_key(egui::Modifiers::CTRL, egui::Key::Num0);
 				action = ShortcutAction::ResetZoom;
 				return; 
+			}
+
+			// 书签：Alt+1..9 记录，F1..F9 转跳
+			for n in 0..9usize {
+				if i.consume_key(egui::Modifiers::CTRL, MARK_SET_KEYS[n]) {
+					action = ShortcutAction::SetMark(n as u8 + 1);
+					return;
+				}
+				if i.consume_key(egui::Modifiers::NONE, MARK_JUMP_KEYS[n]) {
+					action = ShortcutAction::JumpMark(n as u8 + 1);
+					return;
+				}
 			}
 
 			// ---------- 第二优先级：焦点拦截 ----------
@@ -869,6 +918,15 @@ impl PdfApp {
 				action = ShortcutAction::ScrollFullDown; return;
 			}
 
+			if i.consume_key(egui::Modifiers::SHIFT, egui::Key::N) {
+				action = ShortcutAction::NavBack;
+				return;
+			}
+			if i.consume_key(egui::Modifiers::NONE, egui::Key::N) {
+				action = ShortcutAction::NavForward;
+				return;
+			}
+
 
 			// 退出程序快捷键 Q
 			if i.consume_key(egui::Modifiers::NONE, egui::Key::Q) {
@@ -1032,6 +1090,11 @@ impl PdfApp {
 					if let Some(id) = mem.focused() { mem.surrender_focus(id); }
 				});
 			}
+
+			ShortcutAction::SetMark(slot) => self.set_mark(ctx, slot),
+			ShortcutAction::JumpMark(slot) => self.jump_mark(ctx, slot),
+			ShortcutAction::NavBack => self.nav_step(ctx, -1),
+			ShortcutAction::NavForward => self.nav_step(ctx, 1),
 
 			ShortcutAction::None => {}
 		}
@@ -1326,6 +1389,16 @@ impl PdfApp {
 					if ui.button("Merge Files to PDF").clicked() {
 						self.show_merge_window = true;
 					}
+					//多开按钮
+					ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+						if ui.button("Open in New Instance")
+							.on_hover_text("Allow opening multiple instances without IPC restriction").clicked() {
+							if let Some(path) = rfd::FileDialog::new().add_filter("PDF files", &["pdf", "PDF"]).pick_file() {
+								self.load_pdf_path_without_ipc(path);
+							}
+						}
+					});
+
 				}
 
 			});
@@ -1499,9 +1572,17 @@ impl PdfApp {
                                     ui.label("ESC");
                                     ui.end_row();
 
-                                    ui.label("显示目录 (Toc)");
+                                    ui.label("显示目录 (ToC)");
                                     ui.label("Tab");
                                     ui.end_row();
+
+																		ui.label("记录/转跳书签 (Mark / Jump)");
+																		ui.label("CTRL + 1...9  /  F1...F9");
+																		ui.end_row();
+
+																		ui.label("浏览历史 后退/前进 (History back/fwd)");
+																		ui.label("N / n");
+																		ui.end_row();
 
                                     ui.label("回到欢迎界面 (Back to Home)");
                                     ui.label("Q");
@@ -2148,11 +2229,24 @@ impl PdfApp {
 }
 //加载pdf
 impl PdfApp {
-	fn load_pdf_path(&mut self, path: std::path::PathBuf) -> bool {
-		let already_registered = self.ipc_handle.is_some();
-		if !already_registered && !self.try_register_ipc(&path) {
-			return false;
-		}
+    fn load_pdf_path(&mut self, path: std::path::PathBuf) -> bool {
+        let already_registered = self.ipc_handle.is_some();
+        
+        // 加上判断逻辑
+        if !already_registered && !self.try_register_ipc(&path) {
+            return false;
+        }
+
+        // IPC 检查通过或已经注册过，直接调用无 IPC 的纯加载函数
+        self.load_pdf_path_without_ipc(path)
+    }
+}
+impl PdfApp {
+	fn load_pdf_path_without_ipc(&mut self, path: std::path::PathBuf) -> bool {
+		//let already_registered = self.ipc_handle.is_some();
+		//if !already_registered && !self.try_register_ipc(&path) {
+		//	return false;
+		//}
 		let path_str = path.to_string_lossy().to_string();
 
 		// 尝试加载文档
@@ -2167,8 +2261,6 @@ impl PdfApp {
 					// 记录旧文件的位置到历史记录
 					self.record_current_position();
 					// 当加载新 PDF 时，清空之前的擦除记录
-					//self.eraser_strokes.clear();
-					//self.handwriting_strokes.clear();
 					self.annotations.clear();
 					self.current_pen_stroke.clear();
 					self.current_eraser_stroke.clear();
@@ -2315,6 +2407,172 @@ impl PdfApp {
 		self.toc.clear();
 		self.toc_expanded.clear();
 		// ... 其他需要重置的状态
+	}
+}
+
+// 书签
+fn same_pdf(a: &std::path::Path, b: &std::path::Path) -> bool {
+	match (a.canonicalize(), b.canonicalize()) {
+		(Ok(x), Ok(y)) => x == y,
+		_ => a == b,
+	}
+}
+
+impl PdfApp {
+	fn show_mark_msg(&mut self, ctx: &egui::Context, msg: String) {
+		self.mark_msg = Some((msg, ctx.input(|i| i.time)));
+		ctx.request_repaint();
+	}
+
+
+	fn set_mark(&mut self, ctx: &egui::Context, slot: u8) {
+		let Some(path) = self.pdf_path.clone() else { return; };
+		let mark = ViewMark {
+			path,
+			page: self.current_page,
+			zoom: self.zoom_factor,
+			scroll: [self.cur_scroll_offset.x, self.cur_scroll_offset.y],
+			rotation: self.rotations.get(self.current_page).copied().unwrap_or(0.0),
+		};
+		let page = mark.page;
+		self.history.marks.insert(slot, mark);
+		self.save_history();
+		self.show_mark_msg(ctx, format!("已标记 #{}（第 {} 页）", slot, page + 1));
+	}
+
+	// 屏幕底部小提示（可选）
+	fn render_mark_msg(&mut self, ctx: &egui::Context) {
+		let Some((msg, t0)) = self.mark_msg.clone() else { return; };
+		if ctx.input(|i| i.time) - t0 > 1.5 {
+			self.mark_msg = None;
+			return;
+		}
+
+		let painter = ctx.layer_painter(egui::LayerId::new(
+			egui::Order::Foreground,
+			egui::Id::new("mark_toast"),
+		));
+
+		// 单行不折行，路径太长时截断显示
+		let text: String = if msg.chars().count() > 60 {
+			let tail: String = msg.chars().rev().take(57).collect::<Vec<_>>().into_iter().rev().collect();
+			format!("…{}", tail)
+		} else {
+			msg
+		};
+
+		let galley = painter.layout_no_wrap(
+			text,
+			egui::FontId::proportional(16.0),
+			egui::Color32::WHITE,
+		);
+
+		let pad = egui::vec2(14.0, 8.0);
+		let size = galley.size() + pad * 2.0;
+		let screen = ctx.content_rect();
+		let rect = egui::Rect::from_center_size(
+			egui::pos2(screen.center().x, screen.bottom() - 30.0 - size.y * 0.5),
+			size,
+		);
+
+		painter.rect_filled(rect, 6.0, egui::Color32::from_black_alpha(200));
+		painter.galley(rect.min + pad, galley, egui::Color32::WHITE);
+
+		ctx.request_repaint_after(std::time::Duration::from_millis(200));
+	}
+}
+
+impl PdfApp {
+	// 每帧末尾调用：检测"文件+页码"变化并记录；同一页则刷新视图状态
+	fn track_nav(&mut self) {
+		if self.pdf_doc.is_none() { return; }
+		let Some(path) = self.pdf_path.clone() else { return; };
+
+		let cur = ViewMark {
+			path,
+			page: self.current_page,
+			zoom: self.zoom_factor,
+			scroll: [self.cur_scroll_offset.x, self.cur_scroll_offset.y],
+			rotation: self.rotations.get(self.current_page).copied().unwrap_or(0.0),
+		};
+
+		if let Some(e) = self.nav_history.get_mut(self.nav_pos) {
+			// 先比较原始路径（很快），不同再 canonicalize，避免每帧做文件系统调用
+			if e.page == cur.page && (e.path == cur.path || same_pdf(&e.path, &cur.path)) {
+				e.path = cur.path;
+				e.zoom = cur.zoom;
+				e.scroll = cur.scroll;
+				e.rotation = cur.rotation;
+				return;
+			}
+		}
+
+		// 新访问：丢弃"前进"部分（和浏览器一样），再追加
+		if !self.nav_history.is_empty() {
+			self.nav_history.truncate(self.nav_pos + 1);
+		}
+		self.nav_history.push(cur);
+		if self.nav_history.len() > NAV_MAX {
+			self.nav_history.remove(0);
+		}
+		self.nav_pos = self.nav_history.len() - 1;
+	}
+
+	// delta = -1 后退（N），+1 前进（n）
+	fn nav_step(&mut self, ctx: &egui::Context, delta: isize) {
+		let new_pos = self.nav_pos as isize + delta;
+		if new_pos < 0 {
+			self.show_mark_msg(ctx, "已是最早的记录".to_string());
+			return;
+		}
+		if new_pos as usize >= self.nav_history.len() {
+			self.show_mark_msg(ctx, "已是最新的记录".to_string());
+			return;
+		}
+		let entry = self.nav_history[new_pos as usize].clone();
+		if self.restore_view(ctx, &entry) {
+			self.nav_pos = new_pos as usize;
+			self.show_mark_msg(ctx, format!(
+				"历史 {}/{}（第 {} 页）",
+				self.nav_pos + 1, self.nav_history.len(), self.current_page + 1
+			));
+		}
+	}
+}
+impl PdfApp {
+	// 恢复一个视图：同一 PDF 只更新界面，不同 PDF 才 load_pdf_path。成功返回 true
+	fn restore_view(&mut self, ctx: &egui::Context, mark: &ViewMark) -> bool {
+		let same = self.pdf_path.as_deref()
+			.map_or(false, |p| same_pdf(p, &mark.path));
+		if !same && !self.load_pdf_path(mark.path.clone()) {
+			self.show_mark_msg(ctx, format!("无法打开：{}", mark.path.display()));
+			return false;
+		}
+
+		let total = self.pdf_doc.as_ref().map_or(0, |d| d.pages().len() as usize);
+		if total == 0 { return false; }
+
+		self.current_page = mark.page.min(total - 1);
+		self.zoom_factor = mark.zoom;
+		if let Some(r) = self.rotations.get_mut(self.current_page) {
+			*r = mark.rotation;
+		}
+		self.pending_scroll = Some(egui::vec2(mark.scroll[0], mark.scroll[1]));
+		self.goto_buffer.clear();
+		self.pending_g = false;
+		self.texture = None;
+		ctx.request_repaint();
+		true
+	}
+
+	fn jump_mark(&mut self, ctx: &egui::Context, slot: u8) {
+		let Some(mark) = self.history.marks.get(&slot).cloned() else {
+			self.show_mark_msg(ctx, format!("标记 #{} 为空", slot));
+			return;
+		};
+		if self.restore_view(ctx, &mark) {
+			self.show_mark_msg(ctx, format!("转跳 #{}（第 {} 页）", slot, self.current_page + 1));
+		}
 	}
 }
 
@@ -2500,6 +2758,7 @@ impl eframe::App for PdfApp {
 		self.render_top_panel(ctx);
 		self.render_toc_panel(ctx);
 
+
 		// 2. 中央 PDF 显示区域
 		egui::CentralPanel::default().show(ctx, |ui| {
 			if self.pdf_doc.is_some() {
@@ -2571,6 +2830,9 @@ impl eframe::App for PdfApp {
     if self.show_preview_window { 
 			self.render_latex_preview_window(ctx);
 		}
+
+		self.render_mark_msg(ctx);
+		self.track_nav();
 	}
 	fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
 		self.record_current_position();
@@ -2675,6 +2937,8 @@ fn main() -> eframe::Result<()> {
                     egui::pos2(100.0, 0.0),
                 ));
             }
+
+						cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
             setup_fonts(&cc.egui_ctx);
 
             // Pass rx receiver into PdfApp
@@ -2682,6 +2946,7 @@ fn main() -> eframe::Result<()> {
 						app.vim_servername = target_servername;
 						app.editor = target_editor;
 						app.synctex = target_synctex.clone();
+
 
             //if let Some(p) = target_page {
             //    app.current_page = p;

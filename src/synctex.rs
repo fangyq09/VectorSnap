@@ -161,6 +161,7 @@ fn open_editor_from_synctex(
 //open gvim
 fn open_gvim_from_synctex(config: &SynctexEditorConfig, raw_cmd: &str, file: &str, line: &str) {
     let pdf_path = &config.pdf_path;
+    // -----------------------
     let server_name = config.vim_servername
         .as_deref()
         .filter(|s| !s.trim().is_empty())
@@ -172,7 +173,6 @@ fn open_gvim_from_synctex(config: &SynctexEditorConfig, raw_cmd: &str, file: &st
                 .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
                 .collect::<String>()
         });
-
     // 行号只允许数字,避免被注入到 Ex 命令里
     let line = if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) {
         line
@@ -434,16 +434,167 @@ fn open_neovide_from_synctex(
             .spawn()
     );
 }
-// 根据 synctex 正向搜索参数解析出 PDF 页码(0-based)
-// synctex_query 格式: "行:列" 或 "行:列:synctex目录"(目录可为绝对路径,或相对 PDF 所在目录)
-// tex 文件默认与 PDF 同目录同名
+//==================================================
+//// 根据 synctex 正向搜索参数解析出 PDF 页码(0-based)
+////
+//// synctex_query 格式: "行:列:光标所在的tex文件[|编译目录]"
+////   - tex文件: 光标所在的 .tex(分章节写作时是子文件,不是主文件);
+////              建议绝对路径,相对路径以 PDF 所在目录为基准;留空则回退为 PDF 同名 .tex
+////   - 编译目录: 可选。省略 "|" 或 "|" 后为空 → 认为编译产物(.synctex.gz 等)
+////              与 PDF、main.tex 同目录,不加 -d,让 synctex 就地查找;
+////              非空 → 作为 -d 传入(绝对路径,或相对 PDF 所在目录)
+////   用 '|' 分隔编译目录:Windows 路径自带 ':'(C:\...),两个路径字段不能再用 ':' 分隔
+//pub fn resolve_synctex_page(pdf_path: &Path, synctex_query: &str) -> Option<usize> {
+//    // splitn(3): 前两段是纯数字,剩余整体保留,
+//    // tex文件/编译目录里的 ':'(如 Windows 的 C:...)不会被切断
+//    let mut parts = synctex_query.trim().splitn(3, ':');
+//    let line = parts.next()?.trim();
+//    let col = parts.next()?.trim();
+//    let rest = parts.next().unwrap_or("").trim();
+//
+//    if line.is_empty()
+//        || !line.chars().all(|c| c.is_ascii_digit())
+//        || !col.chars().all(|c| c.is_ascii_digit())
+//    {
+//        return None;
+//    }
+//
+//    let base_dir = pdf_path.parent().unwrap_or(Path::new("."));
+//    let resolve = |p: &str| -> PathBuf {
+//        let p = PathBuf::from(p);
+//        if p.is_absolute() { p } else { base_dir.join(p) }
+//    };
+//
+//    // rest = "tex文件" 或 "tex文件|编译目录"
+//    let (file_str, dir_str) = match rest.split_once('|') {
+//        Some((f, d)) => (f.trim(), d.trim()),
+//        None => (rest, ""),
+//    };
+//
+//    // ★ 光标所在的真实源文件;留空时回退为 PDF 同名 .tex
+//    let tex_path = if file_str.is_empty() {
+//        pdf_path.with_extension("tex")
+//    } else {
+//        resolve(file_str)
+//    };
+//
+//    let mut cmd = Command::new("synctex");
+//    cmd.arg("view")
+//        .arg("-i")
+//        .arg(format!("{}:{}:{}", line, col, tex_path.display()))
+//        .arg("-o")
+//        .arg(pdf_path);
+//
+//    // 编译目录非空才加 -d;省略/为空 → 产物与 PDF 同目录,synctex 就地查找
+//    if !dir_str.is_empty() {
+//        cmd.arg("-d").arg(resolve(dir_str));
+//    }
+//
+//    let output = cmd.output().ok()?;
+//    if !output.status.success() {
+//        eprintln!(
+//            "synctex view failed: {}",
+//            String::from_utf8_lossy(&output.stderr).trim()
+//        );
+//        return None;
+//    }
+//    let stdout = String::from_utf8_lossy(&output.stdout);
+//    for l in stdout.lines() {
+//        if let Some(page_str) = l.strip_prefix("Page:") {
+//            if let Ok(p) = page_str.trim().parse::<usize>() {
+//                return Some(p.saturating_sub(1)); // 转 0-based
+//            }
+//        }
+//    }
+//    None
+//}
+//--------------------------------------------------
+//更加坚固的版本，能够识别\input{chaN.tex}这种结构
+//--------------------------------------------------
+// 运行 synctex view,解析出 0-based 页码
+fn synctex_view_page(
+    pdf_path: &Path,
+    tex_path: &Path,
+    line: &str,
+    col: &str,
+    dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Option<usize> {
+    let mut cmd = Command::new("synctex");
+    cmd.arg("view")
+        .arg("-i")
+        .arg(format!("{}:{}:{}", line, col, tex_path.display()))
+        .arg("-o")
+        .arg(pdf_path);
+    if let Some(d) = dir { cmd.arg("-d").arg(d); }
+    if let Some(c) = cwd { cmd.current_dir(c); }
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        eprintln!("synctex view failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for l in stdout.lines() {
+        if let Some(p) = l.strip_prefix("Page:") {
+            if let Ok(p) = p.trim().parse::<usize>() {
+                return Some(p.saturating_sub(1));
+            }
+        }
+    }
+    None
+}
+
+// 若 tex_path 第 line_no 行是 \input/\include/\subfile{X},解析出 X 对应的真实文件
+fn input_target_at(tex_path: &Path, line_no: usize, base_dir: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(tex_path).ok()?;
+    let raw = content.lines().nth(line_no.checked_sub(1)?)?;
+    let line = raw.split('%').next().unwrap_or("").trim(); // 去掉注释,避免命中被注释掉的 \input
+    for cmd in ["\\input", "\\include", "\\subfile"] {
+        let Some(rest) = line.strip_prefix(cmd) else { continue };
+        // 命令后必须是 '{' 或空白,避免误匹配 \includeonly 等更长的命令
+        if rest.starts_with(|c: char| c.is_ascii_alphabetic()) { continue; }
+        let rest = rest.trim_start();
+        let name = if let Some(braced) = rest.strip_prefix('{') {
+            match braced.find('}') {
+                Some(end) => braced[..end].trim(),
+                None => continue,
+            }
+        } else {
+            rest.split_whitespace().next().unwrap_or("") // \input file.tex 裸写法
+        };
+        if name.is_empty() { continue; }
+        if let Some(p) = resolve_input_target(tex_path, base_dir, name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+// 把 \input 的参数解析成存在的 .tex(相对主文件目录 / PDF 目录,可省略 .tex)
+fn resolve_input_target(parent_tex: &Path, base_dir: &Path, name: &str) -> Option<PathBuf> {
+    let name = name.trim();
+    if name.is_empty() { return None; }
+    let mut names = vec![name.to_string()];
+    if !name.ends_with(".tex") { names.push(format!("{}.tex", name)); }
+    let mut dirs: Vec<&Path> = Vec::new();
+    if let Some(p) = parent_tex.parent() { dirs.push(p); }
+    dirs.push(base_dir);
+    for d in dirs {
+        for n in &names {
+            let p = d.join(n); // n 为绝对路径时 join 会直接替换
+            if p.is_file() { return Some(p); }
+        }
+    }
+    None
+}
+
+// synctex_query 格式: "行:列:光标所在的tex文件[|编译目录]"
 pub fn resolve_synctex_page(pdf_path: &Path, synctex_query: &str) -> Option<usize> {
-    // splitn(3):目录放在最后,即使含 ':'(如 Windows 的 C:\...)也不会被切断
     let mut parts = synctex_query.trim().splitn(3, ':');
     let line = parts.next()?.trim();
     let col = parts.next()?.trim();
-    let dir = parts.next().map(str::trim).filter(|d| !d.is_empty());
-
+    let rest = parts.next().unwrap_or("").trim();
     if line.is_empty()
         || !line.chars().all(|c| c.is_ascii_digit())
         || !col.chars().all(|c| c.is_ascii_digit())
@@ -451,45 +602,50 @@ pub fn resolve_synctex_page(pdf_path: &Path, synctex_query: &str) -> Option<usiz
         return None;
     }
 
-    let tex_path = pdf_path.with_extension("tex");
+    let base_dir = pdf_path.parent().unwrap_or(Path::new("."));
+    let resolve = |p: &str| -> PathBuf {
+        let p = PathBuf::from(p);
+        if p.is_absolute() { p } else { base_dir.join(p) }
+    };
+    let (file_str, dir_str) = match rest.split_once('|') {
+        Some((f, d)) => (f.trim(), d.trim()),
+        None => (rest, ""),
+    };
+    let tex_path = if file_str.is_empty() {
+        pdf_path.with_extension("tex")
+    } else {
+        resolve(file_str)
+    };
+    let build_dir = if dir_str.is_empty() { None } else { Some(resolve(dir_str)) };
 
-    let mut cmd = Command::new("synctex");
-    cmd.arg("view")
-        .arg("-i")
-        .arg(format!("{}:{}:{}", line, col, tex_path.display()))
-        .arg("-o")
-        .arg(pdf_path);
-
-    // Vim 提供了目录才加 -d;相对路径以 PDF 所在目录为基准(与反向搜索的约定一致)
-    if let Some(d) = dir {
-        let d = PathBuf::from(d);
-        let d = if d.is_absolute() {
-            d
-        } else {
-            pdf_path.parent().unwrap_or(Path::new(".")).join(d)
-        };
-        cmd.arg("-d").arg(d);
+    // ★ 关键:光标停在 \input/\include 行时,沿链重定向到真正产生内容的文件第 1 行
+    let mut q_tex = tex_path.clone();
+    let mut q_line = line.to_string();
+    let mut q_col = col.to_string();
+    for _ in 0..8 {
+        let Ok(n) = q_line.parse::<usize>() else { break };
+        match input_target_at(&q_tex, n, base_dir) {
+            Some(t) => { q_tex = t; q_line = "1".to_string(); q_col = "1".to_string(); }
+            None => break,
+        }
+    }
+    if let Some(p) = synctex_view_page(pdf_path, &q_tex, &q_line, &q_col, build_dir.as_deref(), None) {
+        return Some(p);
     }
 
-    let output = cmd.output().ok()?;
-
-    if !output.status.success() {
-        eprintln!(
-            "synctex view failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for l in stdout.lines() {
-        if let Some(page_str) = l.strip_prefix("Page:") {
-            if let Ok(p) = page_str.trim().parse::<usize>() {
-                //return Some(p); 
-                return Some(p.saturating_sub(1)); // 转 0-based
-            }
+    // 重定向没查到 → 退回原始文件/行
+    if q_tex != tex_path {
+        if let Some(p) = synctex_view_page(pdf_path, &tex_path, line, col, build_dir.as_deref(), None) {
+            return Some(p);
         }
     }
 
+    // 兜底:相对 PDF 目录的路径 + 以该目录为 cwd(适配记录相对路径的 synctex)
+    if let Ok(rel) = tex_path.strip_prefix(base_dir) {
+        if let Some(p) = synctex_view_page(pdf_path, rel, line, col, build_dir.as_deref(), Some(base_dir)) {
+            return Some(p);
+        }
+    }
     None
 }
+//==================================================

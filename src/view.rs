@@ -296,12 +296,20 @@ impl PdfApp {
 			.auto_shrink([false; 2])
 			.scroll_source(scroll_source);
 
-		if size_changed {
+		//if size_changed {
+		//	let centered = ((display_size - outer_viewport) * 0.5).max(egui::Vec2::ZERO);
+		//	scroll_area = scroll_area.scroll_offset(centered);
+		//}
+		if let Some(off) = self.pending_scroll.take() {
+			// 书签转跳优先于自动居中
+			scroll_area = scroll_area.scroll_offset(off);
+		} else if size_changed {
 			let centered = ((display_size - outer_viewport) * 0.5).max(egui::Vec2::ZERO);
 			scroll_area = scroll_area.scroll_offset(centered);
 		}
 
-		scroll_area.show(ui, |ui| {
+		//scroll_area.show(ui, |ui| {
+		let scroll_out = scroll_area.show(ui, |ui| {
 			if self.scroll_delta != egui::Vec2::ZERO {
 				ui.scroll_with_delta(self.scroll_delta);
 				self.scroll_delta = egui::Vec2::ZERO;
@@ -369,6 +377,8 @@ impl PdfApp {
 				self.handle_selection_interaction(&response, &painter, ctx, page);
 			}
 		});
+
+		self.cur_scroll_offset = scroll_out.state.offset;
 
 		// ★E 记录本帧尺寸（必须在 show() 闭包外面）
 		self.last_layout = Some((self.current_page, angle, display_size));
