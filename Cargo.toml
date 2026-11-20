@@ -1,6 +1,6 @@
 [package]
 name = "VectorSnap"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
@@ -20,6 +20,7 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 base64 = "0.21"
 notify = "6.1.1"
 interprocess = "2.2"
+lopdf = "0.36"
 
 
 [patch.crates-io]
