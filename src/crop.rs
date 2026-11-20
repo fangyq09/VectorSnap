@@ -204,110 +204,120 @@ impl PdfApp {
 }
 //截图
 impl PdfApp {
-pub fn perform_high_res_crop(
-    &mut self, 
-    ctx: &egui::Context, 
-    page: &PdfPage, 
-    local_rect: egui::Rect, 
-    actual_ui_size: egui::Vec2 // 虽然仍传入，但仅用于坐标映射
-) {
-    // 1. 设置目标 DPI (打印级清晰度通常是 300 DPI)
+	pub fn perform_high_res_crop(
+		&mut self, 
+		ctx: &egui::Context, 
+		page: &PdfPage, 
+		local_rect: egui::Rect, 
+		actual_ui_size: egui::Vec2 // 虽然仍传入，但仅用于坐标映射
+	) {
+		// 1. 设置目标 DPI (打印级清晰度通常是 300 DPI)
 		let dpi = self.target_dpi;
 
-    // 2. 获取 PDF 页面在 72 DPI 下的原始 Point 尺寸
-    // 注意：这里需要区分是否旋转，因为 point_width() 返回的是未旋转的
-    let angle = self.rotations.get(self.current_page).copied().unwrap_or(0.0);
-    let is_sideways = ((angle / 90.0).round() as i32).abs() % 2 != 0;
+		// 2. 获取 PDF 页面在 72 DPI 下的原始 Point 尺寸
+		// 注意：这里需要区分是否旋转，因为 point_width() 返回的是未旋转的
+		let angle = self.rotations.get(self.current_page).copied().unwrap_or(0.0);
+		let is_sideways = ((angle / 90.0).round() as i32).abs() % 2 != 0;
 
-    let page_point_width = if is_sideways { page.height().value } else { page.width().value };
-    // let page_point_height = if is_sideways { page.width().value } else { page.height().value }; // 如果需要高度
+		let page_point_width = if is_sideways { page.height().value } else { page.width().value };
+		// let page_point_height = if is_sideways { page.width().value } else { page.height().value }; // 如果需要高度
 
-    // 3. 计算基于 DPI 的目标像素宽度
-    // 物理尺寸 (英寸) = page_point_width / 72.0
-    // 目标像素 = 物理尺寸 * dpi
-    let target_pixel_width = (page_point_width / 72.0 * dpi).round() as u32;
+		// 3. 计算基于 DPI 的目标像素宽度
+		// 物理尺寸 (英寸) = page_point_width / 72.0
+		// 目标像素 = 物理尺寸 * dpi
+		let target_pixel_width = (page_point_width / 72.0 * dpi).round() as u32;
 
-    // --- 获取当前页面的旋转角度 (保持原样) ---
-    let rotation = match ((angle / 90.0).round() as i32) % 4 {
-        1 | -3 => PdfPageRenderRotation::Degrees90,
-        2 | -2 => PdfPageRenderRotation::Degrees180,
-        3 | -1 => PdfPageRenderRotation::Degrees270,
-        _ => PdfPageRenderRotation::None,
-    };
+		// --- 获取当前页面的旋转角度 (保持原样) ---
+		let rotation = match ((angle / 90.0).round() as i32) % 4 {
+			1 | -3 => PdfPageRenderRotation::Degrees90,
+			2 | -2 => PdfPageRenderRotation::Degrees180,
+			3 | -1 => PdfPageRenderRotation::Degrees270,
+			_ => PdfPageRenderRotation::None,
+		};
 
-    // --- 创建渲染配置 (使用新的 target_pixel_width) ---
-    let render_config = PdfRenderConfig::new()
-        .set_target_width(target_pixel_width.try_into().unwrap())
-        .rotate(rotation, true);
+		// --- 创建渲染配置 (使用新的 target_pixel_width) ---
+		let render_config = PdfRenderConfig::new()
+			.set_target_width(target_pixel_width.try_into().unwrap())
+			.rotate(rotation, true);
 
-    if let Ok(bitmap) = page.render_with_config(&render_config) {
-        let full_image = bitmap.as_image().to_rgba8();
-        
-        let img_w = full_image.width() as f32;
-        let img_h = full_image.height() as f32;
+		if let Ok(bitmap) = page.render_with_config(&render_config) {
+			//let full_image = bitmap.as_image().to_rgba8();
 
-        // --- 坐标映射区 (保持原样，因为比例关系未变) ---
-        let left_ratio = (local_rect.min.x / actual_ui_size.x).clamp(0.0, 1.0);
-        let top_ratio = (local_rect.min.y / actual_ui_size.y).clamp(0.0, 1.0);
-        let width_ratio = (local_rect.width() / actual_ui_size.x).clamp(0.0, 1.0);
-        let height_ratio = (local_rect.height() / actual_ui_size.y).clamp(0.0, 1.0);
+			//-------------将笔画插入到截图中-------------
+			let full_rgba = bitmap.as_image().to_rgba8();
+			let mut dyn_img = image::DynamicImage::ImageRgba8(full_rgba);
 
-        // 计算裁剪像素 (基于新渲染的高分大图)
-        let mut crop_x = (left_ratio * img_w).floor() as u32;
-        let mut crop_y = (top_ratio * img_h).floor() as u32;
-        let mut crop_w = (width_ratio * img_w).ceil() as u32;
-        let mut crop_h = (height_ratio * img_h).ceil() as u32;
+			// 将当前页的 Pen 和 Smear 标注按高分图尺寸渲染进去
+			self.draw_annotations_on_image(&mut dyn_img, self.current_page, actual_ui_size.x);
 
-        // --- 崩溃防御区 (保持原样) ---
-        crop_x = crop_x.min(full_image.width().saturating_sub(1));
-        crop_y = crop_y.min(full_image.height().saturating_sub(1));
-        crop_w = crop_w.min(full_image.width() - crop_x);
-        crop_h = crop_h.min(full_image.height() - crop_y);
+			let full_image = dyn_img.to_rgba8();
+			//--------------------------------------------
 
-        if crop_w > 0 && crop_h > 0 {
-            use image::GenericImageView;
-            if crop_x + crop_w <= full_image.width() && crop_y + crop_h <= full_image.height() {
-							// --- 1. 获取原始高分裁剪图 (保持现有逻辑，用于显示和保存) ---
-                let cropped_sub_image = full_image.view(crop_x, crop_y, crop_w, crop_h).to_image();
-                self.last_cropped_image = Some(cropped_sub_image.clone());
+			let img_w = full_image.width() as f32;
+			let img_h = full_image.height() as f32;
 
-								// --- 2. 新增：生成 200 DPI 的 OCR 专用图 ---
-								// 计算缩放比例：从 target_dpi 降到 200
-								let ocr_dpi = 200.0;
-								let scale_factor = ocr_dpi / self.target_dpi; // 比如 200 / 600 = 0.33
+			// --- 坐标映射区 (保持原样，因为比例关系未变) ---
+			let left_ratio = (local_rect.min.x / actual_ui_size.x).clamp(0.0, 1.0);
+			let top_ratio = (local_rect.min.y / actual_ui_size.y).clamp(0.0, 1.0);
+			let width_ratio = (local_rect.width() / actual_ui_size.x).clamp(0.0, 1.0);
+			let height_ratio = (local_rect.height() / actual_ui_size.y).clamp(0.0, 1.0);
 
-								if scale_factor < 1.0 {
-									let ocr_w = (cropped_sub_image.width() as f32 * scale_factor) as u32;
-									let ocr_h = (cropped_sub_image.height() as f32 * scale_factor) as u32;
+			// 计算裁剪像素 (基于新渲染的高分大图)
+			let mut crop_x = (left_ratio * img_w).floor() as u32;
+			let mut crop_y = (top_ratio * img_h).floor() as u32;
+			let mut crop_w = (width_ratio * img_w).ceil() as u32;
+			let mut crop_h = (height_ratio * img_h).ceil() as u32;
 
-									// 使用 Triangle (线性插值) 缩放，速度快且适合 OCR
-									let ocr_image = image::imageops::resize(
-										&cropped_sub_image, 
-										ocr_w.max(1), 
-										ocr_h.max(1), 
-										image::imageops::FilterType::Triangle 
-									);
-									self.last_ocr_image = Some(ocr_image);
-								} else {
-									// 如果设置的 target_dpi 本来就小于等于 200，就直接复用
-									self.last_ocr_image = Some(cropped_sub_image.clone());
-								}
+			// --- 崩溃防御区 (保持原样) ---
+			crop_x = crop_x.min(full_image.width().saturating_sub(1));
+			crop_y = crop_y.min(full_image.height().saturating_sub(1));
+			crop_w = crop_w.min(full_image.width() - crop_x);
+			crop_h = crop_h.min(full_image.height() - crop_y);
 
-								// --- 3. 纹理更新 (用于 UI 预览，依然用高分图) ---
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [cropped_sub_image.width() as usize, cropped_sub_image.height() as usize],
-                    cropped_sub_image.as_raw(),
-                );
+			if crop_w > 0 && crop_h > 0 {
+				use image::GenericImageView;
+				if crop_x + crop_w <= full_image.width() && crop_y + crop_h <= full_image.height() {
+					// --- 1. 获取原始高分裁剪图 (保持现有逻辑，用于显示和保存) ---
+					let cropped_sub_image = full_image.view(crop_x, crop_y, crop_w, crop_h).to_image();
+					self.last_cropped_image = Some(cropped_sub_image.clone());
 
-                self.cropped_tex = Some(ctx.load_texture(
-                    "crop_result",
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                ));
-            }
-        }
-    }
-}
+					// --- 2. 新增：生成 200 DPI 的 OCR 专用图 ---
+					// 计算缩放比例：从 target_dpi 降到 200
+					let ocr_dpi = 200.0;
+					let scale_factor = ocr_dpi / self.target_dpi; // 比如 200 / 600 = 0.33
+
+					if scale_factor < 1.0 {
+						let ocr_w = (cropped_sub_image.width() as f32 * scale_factor) as u32;
+						let ocr_h = (cropped_sub_image.height() as f32 * scale_factor) as u32;
+
+						// 使用 Triangle (线性插值) 缩放，速度快且适合 OCR
+						let ocr_image = image::imageops::resize(
+							&cropped_sub_image, 
+							ocr_w.max(1), 
+							ocr_h.max(1), 
+							image::imageops::FilterType::Triangle 
+						);
+						self.last_ocr_image = Some(ocr_image);
+					} else {
+						// 如果设置的 target_dpi 本来就小于等于 200，就直接复用
+						self.last_ocr_image = Some(cropped_sub_image.clone());
+					}
+
+					// --- 3. 纹理更新 (用于 UI 预览，依然用高分图) ---
+					let color_image = egui::ColorImage::from_rgba_unmultiplied(
+						[cropped_sub_image.width() as usize, cropped_sub_image.height() as usize],
+						cropped_sub_image.as_raw(),
+					);
+
+					self.cropped_tex = Some(ctx.load_texture(
+							"crop_result",
+							color_image,
+							egui::TextureOptions::LINEAR,
+					));
+				}
+			}
+		}
+	}
 }
 //保存图片
 impl PdfApp {

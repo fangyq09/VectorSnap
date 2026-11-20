@@ -493,16 +493,24 @@ impl PdfApp {
 				// --- B. 获取本地路径与执行 ---
 				let (exe, model, mmproj) = get_ocr_paths(&model_cfg)?;
 
-				let output = std::process::Command::new(&exe)
-					.arg("-m").arg(&model)
+				#[cfg(target_os = "windows")]
+				use std::os::windows::process::CommandExt;
+
+				let mut cmd = std::process::Command::new(&exe);
+				cmd.arg("-m").arg(&model)
 					.arg("--jinja")
 					.arg("--mmproj").arg(&mmproj)
 					.arg("--image").arg(&img_path_str)
+					.arg("-ngl").arg("0")
 					.arg("--temp").arg("0.1")
 					.arg("-p").arg(prompt)
 					.arg("-n").arg("2048")
-					.arg("-c").arg("16384")
-					.output()
+					.arg("-c").arg("8192");
+
+				#[cfg(target_os = "windows")]
+				cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+				let output = cmd.output()
 					.map_err(|e| format!("无法启动 {}: {}", exe.display(), e))?;
 
 				if !output.status.success() {

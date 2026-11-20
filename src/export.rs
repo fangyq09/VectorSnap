@@ -134,8 +134,10 @@ impl PdfApp {
 							Annotation::Pen(stroke) => {
 								self.draw_pen_on_image(&mut img_data, stroke, img_w, img_h);
 							}
-							Annotation::Eraser(stroke) => {
-								self.draw_eraser_on_image(&mut img_data, stroke, img_w, img_h);
+							//Annotation::Eraser(stroke) => {
+							Annotation::Smear(stroke) => {
+								//self.draw_eraser_on_image(&mut img_data, stroke, img_w, img_h);
+								self.draw_smear_on_image(&mut img_data, stroke, img_w, img_h, 1.0);
 							}
 						}
 					}
@@ -194,8 +196,10 @@ impl PdfApp {
 									Annotation::Pen(stroke) => {
 										let _ = self.apply_single_pen_stroke(&new_doc, &mut page, stroke, metrics);
 									}
-									Annotation::Eraser(stroke) => {
-										let _ = self.apply_single_eraser(&new_doc, &mut page, stroke, metrics);
+									//Annotation::Eraser(stroke) => {
+									Annotation::Smear(stroke) => {
+										//let _ = self.apply_single_eraser(&new_doc, &mut page, stroke, metrics);
+										let _ = self.apply_single_smear(&new_doc, &mut page, stroke, metrics);
 									}
 								}
 							}
@@ -356,8 +360,10 @@ impl PdfApp {
 										Annotation::Pen(stroke) => {
 											let _ = self.apply_single_pen_stroke(&new_doc, &mut page, stroke, metrics);
 										}
-										Annotation::Eraser(stroke) => {
-											let _ = self.apply_single_eraser(&new_doc, &mut page, stroke, metrics);
+										//Annotation::Eraser(stroke) => {
+										Annotation::Smear(stroke) => {
+											//let _ = self.apply_single_eraser(&new_doc, &mut page, stroke, metrics);
+											let _ = self.apply_single_smear(&new_doc, &mut page, stroke, metrics);
 										}
 									}
 								}

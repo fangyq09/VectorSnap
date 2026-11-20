@@ -4,13 +4,28 @@ use image::{GenericImageView, GenericImage};
 use crate::PdfApp;
 
 
+//#[derive(Clone)]
+//pub struct EraseStroke {
+//    pub points: Vec<egui::Pos2>,
+//    pub brush_size: f32,
+//		pub color: egui::Color32,
+//}
+//impl Default for EraseStroke {
+//	fn default() -> Self {
+//		Self {
+//			points: Vec::new(),
+//			brush_size: 20.0,
+//			color: egui::Color32::WHITE,
+//		}
+//	}
+//}
 #[derive(Clone)]
-pub struct EraseStroke {
-    pub points: Vec<egui::Pos2>,
-    pub brush_size: f32,
-		pub color: egui::Color32,
+pub struct SmearStroke {
+	pub points: Vec<egui::Pos2>,
+	pub brush_size: f32,
+	pub color: egui::Color32,
 }
-impl Default for EraseStroke {
+impl Default for SmearStroke {
 	fn default() -> Self {
 		Self {
 			points: Vec::new(),
@@ -19,10 +34,15 @@ impl Default for EraseStroke {
 		}
 	}
 }
+//#[derive(Clone, Copy, PartialEq, Eq)]
+//pub enum ToolMode {
+//    Pen,
+//    Eraser,
+//}
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ToolMode {
-    Pen,
-    Eraser,
+	Pen,
+	Smear,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct StrokePoint {
@@ -38,10 +58,15 @@ pub enum ColorShape {
     Circle,
     Rect,
 }
+//#[derive(Clone)]
+//pub enum Annotation {
+//    Pen(Stroke),
+//    Eraser(EraseStroke),
+//}
 #[derive(Clone)]
 pub enum Annotation {
-    Pen(Stroke),
-    Eraser(EraseStroke),
+	Pen(Stroke),
+	Smear(SmearStroke),
 }
 
 //笔迹
@@ -83,14 +108,14 @@ impl PdfApp {
     }
 
     // 渲染橡皮擦
-   pub fn draw_eraser_on_image(&self, img: &mut image::DynamicImage, stroke: &EraseStroke, w: u32, h: u32) {
-        let rgba = stroke.color.to_array();
-        let color = image::Rgba([rgba[0], rgba[1], rgba[2], rgba[3]]);
-        
-        for window in stroke.points.windows(2) {
-            self.draw_line_on_image(img, window[0], window[1], stroke.brush_size, color, w, h);
-        }
-    }
+   //pub fn draw_eraser_on_image(&self, img: &mut image::DynamicImage, stroke: &EraseStroke, w: u32, h: u32) {
+   //     let rgba = stroke.color.to_array();
+   //     let color = image::Rgba([rgba[0], rgba[1], rgba[2], rgba[3]]);
+   //     
+   //     for window in stroke.points.windows(2) {
+   //         self.draw_line_on_image(img, window[0], window[1], stroke.brush_size, color, w, h);
+   //     }
+   // }
 
     // 底层绘制方法：将归一化坐标转换为像素坐标并绘制
    pub fn draw_line_on_image(&self, img: &mut image::DynamicImage, p1: egui::Pos2, p2: egui::Pos2, width: f32, color: image::Rgba<u8>, w: u32, h: u32) {
@@ -102,6 +127,102 @@ impl PdfApp {
         // 这里调用你原来的 draw_line，但增加颜色参数
         draw_line_with_color(img, x1, y1, x2, y2, (width / 2.0) as i32, color);
     }
+}
+impl PdfApp {
+	pub fn draw_smear_on_image(
+		&self,
+		img: &mut image::DynamicImage,
+		stroke: &SmearStroke,
+		w: u32,
+		h: u32,
+		width_scale: f32,
+	) {
+		let rgba = stroke.color.to_array();
+		let color = image::Rgba([rgba[0], rgba[1], rgba[2], rgba[3]]);
+		let scaled_brush = stroke.brush_size * width_scale;
+
+		for window in stroke.points.windows(2) {
+			self.draw_line_on_image(img, window[0], window[1], scaled_brush, color, w, h);
+		}
+	}
+
+	pub fn draw_annotations_on_image(
+		&self,
+		img: &mut image::DynamicImage,
+		page_index: usize,
+		ui_width: f32,
+	) {
+		let Some(annos) = self.annotations.get(&page_index) else {
+			return;
+		};
+		let (w, h) = img.dimensions();
+		let width_scale = w as f32 / ui_width.max(1.0);
+
+		for anno in annos {
+			match anno {
+				Annotation::Pen(stroke) => {
+					if stroke.points.len() < 2 {
+						continue;
+					}
+					let rgba = stroke.color.to_array();
+					let color = image::Rgba([rgba[0], rgba[1], rgba[2], rgba[3]]);
+
+					if stroke.points.len() < 3 {
+						let p1 = stroke.points[0];
+						let p2 = stroke.points[1];
+						self.draw_line_on_image(
+							img,
+							p1.pos,
+							p2.pos,
+							p2.width * width_scale,
+							color,
+							w,
+							h,
+						);
+					} else {
+						for i in 0..stroke.points.len() - 2 {
+							let p0 = stroke.points[i];
+							let p1 = stroke.points[i + 1];
+							let p2 = stroke.points[i + 2];
+
+							let mid_start = p0.pos.lerp(p1.pos, 0.5);
+							let mid_end = p1.pos.lerp(p2.pos, 0.5);
+
+							let steps = 5;
+							for s in 0..steps {
+								let t = s as f32 / steps as f32;
+								let t_next = (s + 1) as f32 / steps as f32;
+
+								let pos_curr = mid_start
+									.lerp(p1.pos, t)
+									.lerp(p1.pos.lerp(mid_end, t), t);
+								let pos_next = mid_start
+									.lerp(p1.pos, t_next)
+									.lerp(p1.pos.lerp(mid_end, t_next), t_next);
+								let current_width =
+									(p1.width + (p2.width - p1.width) * t) * width_scale;
+
+								self.draw_line_on_image(
+									img,
+									pos_curr,
+									pos_next,
+									current_width,
+									color,
+									w,
+									h,
+								);
+							}
+						}
+					}
+				}
+				Annotation::Smear(stroke) => {
+					if stroke.points.len() >= 2 {
+						self.draw_smear_on_image(img, stroke, w, h, width_scale);
+					}
+				}
+			}
+		}
+	}
 }
 fn draw_circle_with_color(img: &mut image::DynamicImage, cx: i32, cy: i32, radius: i32, color: image::Rgba<u8>) {
     let (w, h) = img.dimensions();
@@ -173,8 +294,10 @@ impl PdfApp {
 					Annotation::Pen(stroke) => {
 						self.apply_single_pen_stroke(doc, &mut page, stroke, metrics)?;
 					}
-					Annotation::Eraser(stroke) => {
-						self.apply_single_eraser(doc, &mut page, stroke, metrics)?;
+					//Annotation::Eraser(stroke) => {
+					Annotation::Smear(stroke) => {
+						//self.apply_single_eraser(doc, &mut page, stroke, metrics)?;
+						self.apply_single_smear(doc, &mut page, stroke, metrics)?;
 					}
 				}
 			}
@@ -197,11 +320,13 @@ impl PdfApp {
 }
 impl PdfApp {
 	// 处理单条擦除
-	pub fn apply_single_eraser<'a>(
+	//pub fn apply_single_eraser<'a>(
+	pub fn apply_single_smear<'a>(
 		&self,
 		doc: &pdfium_render::prelude::PdfDocument<'a>,
 		page: &mut pdfium_render::prelude::PdfPage<'a>,
-		stroke: &EraseStroke,
+		//stroke: &EraseStroke,
+		stroke: &SmearStroke,
 		metrics: (f32, f32, f32, f32, f32),
 	) -> Result<(), Box<dyn std::error::Error>> {
 		let (left, bottom, pw, ph, scale_factor) = metrics;
@@ -354,13 +479,18 @@ impl PdfApp {
 					}
 				}
 
-				ToolMode::Eraser => {
+				//ToolMode::Eraser => {
+				ToolMode::Smear => {
 					if resp.drag_started() {
-						self.current_eraser_stroke.clear();
-						self.current_eraser_stroke.push(p);
+						//self.current_eraser_stroke.clear();
+						self.current_smear_stroke.clear();
+						//self.current_eraser_stroke.push(p);
+						self.current_smear_stroke.push(p);
 					} else if resp.dragged() {
-						if self.current_eraser_stroke.last() != Some(&p) {
-							self.current_eraser_stroke.push(p);
+						//if self.current_eraser_stroke.last() != Some(&p) {
+						if self.current_smear_stroke.last() != Some(&p) {
+							//self.current_eraser_stroke.push(p);
+							self.current_smear_stroke.push(p);
 						}
 					}
 				}
@@ -385,19 +515,27 @@ impl PdfApp {
 					}
 					self.current_pen_stroke.clear();
 				}
-				ToolMode::Eraser => {
-					if !self.current_eraser_stroke.is_empty() {
-						let stroke = EraseStroke {
-							points: self.current_eraser_stroke.clone(),
-							brush_size: self.eraser_size,
-							color: self.eraser_color,
+				//ToolMode::Eraser => {
+				ToolMode::Smear => {
+					//if !self.current_eraser_stroke.is_empty() {
+					if !self.current_smear_stroke.is_empty() {
+						//let stroke = EraseStroke {
+						let stroke = SmearStroke {
+							//points: self.current_eraser_stroke.clone(),
+							points: self.current_smear_stroke.clone(),
+							//brush_size: self.eraser_size,
+							brush_size: self.smear_size,
+							//color: self.eraser_color,
+							color: self.smear_color,
 						};
 						self.annotations
 							.entry(self.current_page)
 							.or_default()
-							.push(Annotation::Eraser(stroke)); // 统一推入
+							//.push(Annotation::Eraser(stroke)); // 统一推入
+							.push(Annotation::Smear(stroke)); // 统一推入
 					}
-					self.current_eraser_stroke.clear();
+					//self.current_eraser_stroke.clear();
+					self.current_smear_stroke.clear();
 				}
 			}
 		}
@@ -412,11 +550,14 @@ impl PdfApp {
 			//self.draw_pressure_segments(&painter, &self.current_pen_stroke, aligned_rect, self.pen_color);
 			self.draw_pressure_segments(&painter, &self.current_pen_stroke, aligned_rect, self.pen_color);
 		}
-		if self.current_eraser_stroke.len() >= 2 {
-			let pts: Vec<egui::Pos2> = self.current_eraser_stroke.iter()
+		//if self.current_eraser_stroke.len() >= 2 {
+		if self.current_smear_stroke.len() >= 2 {
+			//let pts: Vec<egui::Pos2> = self.current_eraser_stroke.iter()
+			let pts: Vec<egui::Pos2> = self.current_smear_stroke.iter()
 				.map(|p| self.from_normalized(*p, aligned_rect))
 				.collect();
-				painter.add(egui::Shape::line(pts, egui::Stroke::new(self.eraser_size, self.eraser_color)));
+				//painter.add(egui::Shape::line(pts, egui::Stroke::new(self.eraser_size, self.eraser_color)));
+				painter.add(egui::Shape::line(pts, egui::Stroke::new(self.smear_size, self.smear_color)));
 		}
 
 		// =========================================================
@@ -488,7 +629,8 @@ impl PdfApp {
 							self.draw_pressure_segments(&painter, &stroke.points, aligned_rect, stroke.color);
 						}
 					}
-					Annotation::Eraser(stroke) => {
+					//Annotation::Eraser(stroke) => {
+					Annotation::Smear(stroke) => {
 						if stroke.points.len() >= 2 {
 							let pts: Vec<egui::Pos2> = stroke.points.iter()
 								.map(|p| self.from_normalized(*p, aligned_rect))
@@ -520,14 +662,16 @@ fn from_normalized(&self, p: egui::Pos2, rect: egui::Rect) -> egui::Pos2 {
 fn current_brush_color(&self) -> egui::Color32 {
     match self.tool_mode {
         ToolMode::Pen => self.pen_color,
-        ToolMode::Eraser => egui::Color32::WHITE,
+        //ToolMode::Eraser => egui::Color32::WHITE,
+        ToolMode::Smear => egui::Color32::WHITE,
     }
 }
 
 fn current_brush_size(&self) -> f32 {
     match self.tool_mode {
         ToolMode::Pen => self.pen_size,
-        ToolMode::Eraser => self.eraser_size,
+        //ToolMode::Eraser => self.eraser_size,
+        ToolMode::Smear => self.smear_size,
     }
 }
 fn draw_tool_cursor(&self, ui: &egui::Ui, rect: egui::Rect) {
@@ -546,11 +690,13 @@ fn draw_tool_cursor(&self, ui: &egui::Ui, rect: egui::Rect) {
     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
 
     match self.tool_mode {
-        ToolMode::Eraser => self.draw_eraser_cursor(ui, mouse_pos),
+        //ToolMode::Eraser => self.draw_eraser_cursor(ui, mouse_pos),
+        ToolMode::Smear => self.draw_smear_cursor(ui, mouse_pos),
         ToolMode::Pen => self.draw_pen_cursor(ui, mouse_pos),
     }
 }
-fn draw_eraser_cursor(&self, ui: &egui::Ui, mouse_pos: egui::Pos2) {
+//fn draw_eraser_cursor(&self, ui: &egui::Ui, mouse_pos: egui::Pos2) {
+fn draw_smear_cursor(&self, ui: &egui::Ui, mouse_pos: egui::Pos2) {
     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
 
     let size = self.current_brush_size();

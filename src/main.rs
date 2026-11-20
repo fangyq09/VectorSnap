@@ -29,7 +29,7 @@ mod view;
 mod toc;
 
 use crate::handwriting::{
-    //EraseStroke,
+    //SmearStroke,
     //Stroke,
     ToolMode,
     StrokePoint,
@@ -56,11 +56,14 @@ pub struct AppConfig {
 	#[serde(default = "default_true")]
 	pub show_favorites: bool,
 
+	#[serde(default = "default_false")]
+	pub show_quick_access_folders: bool,
+
 	pub favorite_files: Vec<std::path::PathBuf>,
 
 	pub favorite_folders: Vec<std::path::PathBuf>,
 
-	#[serde(default)] 
+	#[serde(default = "default_false")]
 	pub show_full_path: bool,
 
 	#[serde(default = "default_editor_command")]
@@ -71,6 +74,9 @@ pub struct AppConfig {
 
 	#[serde(default)]
 	pub current_ocr_model_name: String,
+
+	#[serde(default)]
+	pub default_ocr_model_name: String,
 
 	#[serde(default = "default_true")]
 	pub auto_crop_dpi: bool,
@@ -91,6 +97,9 @@ pub struct AppConfig {
 
 fn default_true() -> bool {
     true
+}
+fn default_false() -> bool {
+    false
 }
 
 fn default_nvim_socket() -> String {
@@ -133,6 +142,7 @@ impl Default for AppConfig {
 	fn default() -> Self {
 		Self {
 			show_favorites: true,
+			show_quick_access_folders: false,
 			favorite_files: vec![],
 			favorite_folders: vec![],
 			show_full_path: false,
@@ -148,6 +158,7 @@ impl Default for AppConfig {
 				},
 			],
 			current_ocr_model_name: "GLM-OCR".to_string(),
+			default_ocr_model_name: "GLM-OCR".to_string(),
 			auto_crop_dpi: true,
 			synctex_dir: String::new(),
 			nvim_socket: default_nvim_socket(),
@@ -307,12 +318,15 @@ struct PdfApp {
 		last_pdf_height: f32,
 		is_edit_mode: bool,
 		current_pen_stroke: Vec<StrokePoint>,
-		current_eraser_stroke: Vec<egui::Pos2>,
+		//current_eraser_stroke: Vec<egui::Pos2>,
+		current_smear_stroke: Vec<egui::Pos2>,
 		tool_mode: ToolMode,
 		pen_color: egui::Color32,
 		pen_size: f32,
-		eraser_size: f32,
-		eraser_color: egui::Color32,
+		//eraser_size: f32,
+		smear_size: f32,
+		//eraser_color: egui::Color32,
+		smear_color: egui::Color32,
 		annotations: std::collections::BTreeMap<usize, Vec<Annotation>>,
 		last_pressure: f32,
 		last_time_stamp: f32,
@@ -563,12 +577,16 @@ impl PdfApp {
 			last_pdf_height: 0.0,
 			is_edit_mode: false,
 			current_pen_stroke: Vec::new(),
-			current_eraser_stroke: Vec::new(),
-			tool_mode: ToolMode::Eraser,
+			//current_eraser_stroke: Vec::new(),
+			current_smear_stroke: Vec::new(),
+			//tool_mode: ToolMode::Eraser,
+			tool_mode: ToolMode::Smear,
 			pen_color: egui::Color32::BLACK,
 			pen_size: 2.0,
-			eraser_size: 20.0,
-			eraser_color: egui::Color32::WHITE,
+			//eraser_size: 20.0,
+			smear_size: 20.0,
+			//eraser_color: egui::Color32::WHITE,
+			smear_color: egui::Color32::WHITE,
 			annotations: std::collections::BTreeMap::new(),
 			last_pressure: 0.0,
 			last_time_stamp: 0.0,
@@ -1100,6 +1118,48 @@ impl PdfApp {
 		}
 	}
 }
+//模型加载辅助函数
+impl PdfApp {
+	fn select_ocr_model_by_name(&mut self, target_name: &str) -> bool {
+		if let Some(m) = self.config.ocr_models.iter().find(|m| m.name == target_name) {
+			self.config.current_ocr_model_name = m.name.clone();
+			self.ocr_model_name = m.model_id.clone();
+			self.ocr_api_token = m.api_token.clone();
+			self.ocr_api_url = m.api_url.clone();
+			self.ocr_provider = m.provider.clone();
+			return true;
+		}
+		false
+	}
+
+	//fn reset_ocr_to_default_glm(&mut self) {
+	//	// 优先按名称匹配本地 GLM-OCR；若列表里名称略有差异，则兜底匹配 provider == "local" 且包含 "glm" 的模型
+	//	if self.select_ocr_model_by_name("GLM-OCR") {
+	//		return;
+	//	}
+	//	if let Some(m) = self.config.ocr_models.iter().find(|m| {
+	//		m.provider.eq_ignore_ascii_case("local") && m.name.to_lowercase().contains("glm")
+	//	}) {
+	//		let name = m.name.clone();
+	//		self.select_ocr_model_by_name(&name);
+	//	}
+	//}
+	fn reset_ocr_to_default_model(&mut self) {
+		let preferred = self.config.default_ocr_model_name.trim().to_string();
+		if !preferred.is_empty() && self.select_ocr_model_by_name(&preferred) {
+			return;
+		}
+
+		let current = self.config.current_ocr_model_name.trim().to_string();
+		if !current.is_empty() && self.select_ocr_model_by_name(&current) {
+			return;
+		}
+
+		if let Some(first_name) = self.config.ocr_models.first().map(|m| m.name.clone()) {
+			self.select_ocr_model_by_name(&first_name);
+		}
+	}
+}
 //菜单栏
 impl PdfApp {
 	fn render_top_panel(&mut self, ctx: &egui::Context) {
@@ -1214,8 +1274,10 @@ impl PdfApp {
 								if ui.selectable_label(self.tool_mode == ToolMode::Pen, "✏ Pen").clicked() {
 									self.tool_mode = ToolMode::Pen;
 								}
-								if ui.selectable_label(self.tool_mode == ToolMode::Eraser, "Eraser").clicked() {
-									self.tool_mode = ToolMode::Eraser;
+								//if ui.selectable_label(self.tool_mode == ToolMode::Eraser, "Eraser").clicked() {
+								if ui.selectable_label(self.tool_mode == ToolMode::Smear, "Smear").clicked() {
+									//self.tool_mode = ToolMode::Eraser;
+									self.tool_mode = ToolMode::Smear;
 								}
 								ui.menu_button("Settings", |ui| {
 									ui.group(|ui| {
@@ -1235,19 +1297,23 @@ impl PdfApp {
 									});
 									ui.separator();
 									ui.group(|ui| {
-										ui.label("Eraser");
+										//ui.label("Eraser");
+										ui.label("Smear");
 										ui.horizontal(|ui| {
 											ui.label("Size:");
-											ui.add(egui::Slider::new(&mut self.eraser_size, 5.0..=50.0));
+											//ui.add(egui::Slider::new(&mut self.eraser_size, 5.0..=50.0));
+											ui.add(egui::Slider::new(&mut self.smear_size, 5.0..=50.0));
 										});
-										let eraser_colors = [
+										//let eraser_colors = [
+										let smear_colors = [
 											egui::Color32::WHITE,
 											egui::Color32::from_rgb(240, 240, 240), 
 											egui::Color32::BLACK,
 											egui::Color32::YELLOW, 
 											egui::Color32::from_rgb(75, 0, 130),
 										];
-										color_selector(ui, &mut self.eraser_color, &eraser_colors, ColorShape::Rect);
+										//color_selector(ui, &mut self.eraser_color, &eraser_colors, ColorShape::Rect);
+										color_selector(ui, &mut self.smear_color, &smear_colors, ColorShape::Rect);
 									});
 								});
 
@@ -1308,39 +1374,31 @@ impl PdfApp {
 							});
 
 							ui.separator();
-							//let current_model_name = self.config.ocr_models.iter()
-							//	.find(|m| m.model_id == self.config.current_ocr_model_name)
-							//	.map(|m| m.name.as_str())
-							//	.unwrap_or("Select Model");
-							//ui.menu_button(format!("OCR Model: {}", current_model_name), |ui| {
-							//	for model in &self.config.ocr_models {
-							//		let is_selected = model.model_id == self.config.current_ocr_model_name;
-							//		if ui.selectable_label(is_selected, &model.name).clicked() {
-							//			self.config.current_ocr_model_name = model.model_id.clone();
-							//			self.ocr_model_name = model.model_id.clone();
-							//			self.ocr_api_token = model.api_token.clone();
-							//			self.ocr_api_url = model.api_url.clone();
-							//			self.ocr_provider = model.provider.clone();
-							//			//self.config.save(); // 自动保存选择
-							//			ui.close_kind(egui::UiKind::Menu); 
-							//		}
-							//	}
-							//});
 							let current_display_name = self.config.ocr_models.iter()
 								.find(|m| m.name == self.config.current_ocr_model_name)
 								.map(|m| m.name.as_str())
 								.unwrap_or("Select Model");
+							//ui.menu_button(format!("OCR Model: {}", current_display_name), |ui| {
+							//	for model in &self.config.ocr_models {
+							//		let is_selected = model.name == self.config.current_ocr_model_name;
+							//		if ui.selectable_label(is_selected, &model.name).clicked() {
+							//			self.config.current_ocr_model_name = model.name.clone();
+							//			self.ocr_model_name = model.model_id.clone();
+							//			self.ocr_api_token = model.api_token.clone();
+							//			self.ocr_api_url = model.api_url.clone();
+							//			self.ocr_provider = model.provider.clone();
+							//			//self.save_all_config();// 保存配置
+							//			ui.close_kind(egui::UiKind::Menu); 
+							//		}
+							//	}
+							//});
 							ui.menu_button(format!("OCR Model: {}", current_display_name), |ui| {
-								for model in &self.config.ocr_models {
-									let is_selected = model.name == self.config.current_ocr_model_name;
-									if ui.selectable_label(is_selected, &model.name).clicked() {
-										self.config.current_ocr_model_name = model.name.clone();
-										self.ocr_model_name = model.model_id.clone();
-										self.ocr_api_token = model.api_token.clone();
-										self.ocr_api_url = model.api_url.clone();
-										self.ocr_provider = model.provider.clone();
-										//self.save_all_config();// 保存配置
-										ui.close_kind(egui::UiKind::Menu); 
+								let model_names: Vec<String> = self.config.ocr_models.iter().map(|m| m.name.clone()).collect();
+								for name in model_names {
+									let is_selected = name == self.config.current_ocr_model_name;
+									if ui.selectable_label(is_selected, &name).clicked() {
+										self.select_ocr_model_by_name(&name);
+										ui.close_kind(egui::UiKind::Menu);
 									}
 								}
 							});
@@ -1607,7 +1665,6 @@ impl PdfApp {
         }
     }
 }
-//设置窗口
 // 设置窗口：一行 “标签 + 路径输入框 + 浏览按钮 + 状态”
 // exts 为空表示不过滤；hint 为空表示该项必填（缺失时显示 ⚠）
 fn ocr_path_row(ui: &mut egui::Ui, label: &str, value: &mut String, exts: &[&str], hint: &str) {
@@ -1643,7 +1700,7 @@ fn ocr_path_row(ui: &mut egui::Ui, label: &str, value: &mut String, exts: &[&str
 		}
 	});
 }
-
+//设置窗口
 impl PdfApp {
 	fn render_settings_window(&mut self, ctx: &egui::Context) {
 		let mut is_open = self.show_settings_window;
@@ -1674,13 +1731,43 @@ impl PdfApp {
 
 						// 收藏夹
 						ui.horizontal(|ui| {
-							ui.label("Show Favorites Files and Directory:");
+							ui.label("Show Favorites Files:");
 							let mut enable_show_favorites = self.config.show_favorites;
 							if ui.checkbox(&mut enable_show_favorites, "Enable Show Favorites").changed() {
 								self.config.show_favorites = enable_show_favorites;
 							}
 						});
 						ui.add_space(15.0);
+
+						ui.horizontal(|ui| {
+							ui.label("Show Full Path in Favorites:");
+							let mut enable_full_path = self.config.show_full_path;
+							if ui.checkbox(&mut enable_full_path, "Show Full Path").changed() {
+								self.config.show_full_path = enable_full_path;
+							}
+						});
+						ui.add_space(15.0);
+
+						ui.horizontal(|ui| {
+							ui.label("Show Quick Access Folders:");
+							let mut enable_show_folders = self.config.show_quick_access_folders;
+							if ui.checkbox(&mut enable_show_folders, "Enable Show Quick Access Folders").changed() {
+								self.config.show_quick_access_folders = enable_show_folders;
+							}
+						});
+						ui.add_space(15.0);
+
+						ui.horizontal(|ui| {
+							ui.label("Auto Crop DPI:");
+							let mut auto_dpi = self.config.auto_crop_dpi;
+							if ui.checkbox(&mut auto_dpi, "Enable Auto Crop DPI").changed() {
+								self.config.auto_crop_dpi = auto_dpi;
+								self.enable_auto_crop_dpi = auto_dpi;
+							}
+						});
+						ui.add_space(15.0);
+
+
 
 						// 1. SyncTeX 目录配置
 						ui.horizontal(|ui| {
@@ -1734,20 +1821,69 @@ impl PdfApp {
 										Use {file} for the source file and {line} for the line number.");
 						ui.add_space(15.0);
 
-						// 4. 自动 DPI 开关
-						let mut auto_dpi = self.config.auto_crop_dpi;
-						if ui.checkbox(&mut auto_dpi, "Enable Auto Crop DPI (Vector vs Raster)").changed() {
-							self.config.auto_crop_dpi = auto_dpi;
-							self.enable_auto_crop_dpi = auto_dpi;
-						}
+						//// 4. 自动 DPI 开关
+						//let mut auto_dpi = self.config.auto_crop_dpi;
+						//if ui.checkbox(&mut auto_dpi, "Enable Auto Crop DPI (Vector vs Raster)").changed() {
+						//	self.config.auto_crop_dpi = auto_dpi;
+						//	self.enable_auto_crop_dpi = auto_dpi;
+						//}
 
 						ui.add_space(20.0);
 						ui.separator();
 						ui.add_space(10.0);
 
 						// 5. OCR 模型管理
-						ui.heading("🤖 OCR Models");
+						ui.heading("⚙ OCR Models");
 						ui.add_space(8.0);
+						//ui.horizontal(|ui| {
+						//	ui.label("Default Model on Open PDF:");
+						//	let current_default_label = if self.config.default_ocr_model_name.trim().is_empty() {
+						//		"(Follow Current)".to_string()
+						//	} else {
+						//		self.config.default_ocr_model_name.clone()
+						//	};
+						//	egui::ComboBox::from_id_salt("default_ocr_model_combo")
+						//		.selected_text(current_default_label)
+						//		.show_ui(ui, |ui| {
+						//			ui.selectable_value(
+						//				&mut self.config.default_ocr_model_name,
+						//				String::new(),
+						//				"(Follow Current)",
+						//			);
+						//			for model in &self.config.ocr_models {
+						//				ui.selectable_value(
+						//					&mut self.config.default_ocr_model_name,
+						//					model.name.clone(),
+						//					&model.name,
+						//				);
+						//			}
+						//		});
+						//});
+						//ui.add_space(8.0);
+						ui.horizontal(|ui| {
+							ui.label("Default Model on Open PDF:");
+							let current_default_label = if self.config.default_ocr_model_name.trim().is_empty() {
+								self.config
+									.ocr_models
+									.first()
+									.map(|m| m.name.clone())
+									.unwrap_or_else(|| "Select Model".to_string())
+							} else {
+								self.config.default_ocr_model_name.clone()
+							};
+							egui::ComboBox::from_id_salt("default_ocr_model_combo")
+								.selected_text(current_default_label)
+								.show_ui(ui, |ui| {
+									for model in &self.config.ocr_models {
+										ui.selectable_value(
+											&mut self.config.default_ocr_model_name,
+											model.name.clone(),
+											&model.name,
+										);
+									}
+								});
+						});
+						ui.add_space(10.0);
 
 						let mut model_to_remove = None;
 						for (idx, model) in self.config.ocr_models.iter().enumerate() {
@@ -1791,6 +1927,15 @@ impl PdfApp {
 								self.ocr_api_token = next.api_token.clone();
 								self.ocr_api_url = next.api_url.clone();
 								self.ocr_provider = next.provider.clone();
+							}
+
+							if removed.name == self.config.default_ocr_model_name {
+								self.config.default_ocr_model_name = self
+									.config
+									.ocr_models
+									.first()
+									.map(|m| m.name.clone())
+									.unwrap_or_default();
 							}
 
 							self.save_all_config(); // 立即写入 config.json
@@ -1953,42 +2098,42 @@ impl PdfApp {
         self.texture = None;
     }
 }
-//收藏夹
+// 收藏夹 & 快捷访问文件夹
 impl PdfApp {
 	fn render_favorites(&mut self, ui: &mut egui::Ui) {
-		if !self.config.show_favorites {return;}
+		if !self.config.show_favorites {
+			return;
+		}
 
 		let mut to_open: Option<PathBuf> = None;
 		let mut file_to_remove: Option<usize> = None;
-		let mut folder_to_remove: Option<usize> = None;
-		let mut move_file: Option<(usize, isize)> = None;   // (索引, 方向: -1上, 1下)
-		let mut move_folder: Option<(usize, isize)> = None;
+		let mut move_file: Option<(usize, isize)> = None; // (索引, 方向: -1上, 1下, -2置顶, 2置底)
 
 		ui.vertical_centered(|ui| {
 			ui.heading("Favorites");
 			ui.add_space(20.0);
+
 			// --- 切换开关 ---
 			let target_value = !self.config.show_full_path;
-			let toggle_label = if self.config.show_full_path { 
-				"Display Mode: Full Path" 
-			} else { 
+			let toggle_label = if self.config.show_full_path {
+				"Display Mode: Full Path"
+			} else {
 				"Display Mode: File Name Only"
 			};
 
-			// 参数：可变引用, 选中时赋予的值, 文本标签
 			if ui.selectable_value(&mut self.config.show_full_path, target_value, toggle_label)
-				.on_hover_text("Click to toggle display mode").changed() 
+				.on_hover_text("Click to toggle display mode")
+				.changed()
 			{
 				self.save_all_config();
 			}
 			ui.add_space(10.0);
-			// ----------------------
 
 			egui::ScrollArea::vertical()
-				.max_height(400.0) // Optional: Cap the height so it doesn't take the whole screen
-				.auto_shrink([false, true]) 
+				.max_height(400.0)
+				.id_salt("favorites_scroll")
+				.auto_shrink([false, true])
 				.show(ui, |ui| {
-					// Ensure buttons stay centered inside the scroll area
 					ui.vertical_centered(|ui| {
 						let total_files = self.config.favorite_files.len();
 						for (idx, path) in self.config.favorite_files.iter().enumerate() {
@@ -2009,15 +2154,6 @@ impl PdfApp {
 							}
 
 							response.context_menu(|ui| {
-								// 移动功能
-								//if idx > 0 && ui.button("⬆ Move Up").clicked() {
-								//	move_file = Some((idx, -1));
-								//	ui.close_kind(egui::UiKind::Menu);
-								//}
-								//if idx < self.config.favorite_files.len() - 1 && ui.button("⬇ Move Down").clicked() {
-								//	move_file = Some((idx, 1));
-								//	ui.close_kind(egui::UiKind::Menu);
-								//}
 								if idx > 0 {
 									if ui.button("⏫ Move to Top").clicked() {
 										move_file = Some((idx, -2));
@@ -2044,11 +2180,10 @@ impl PdfApp {
 								if ui.button("🔍 Open another PDF from the Folder").clicked() {
 									let folder = path.parent().unwrap_or(std::path::Path::new("."));
 
-									// 调用文件选择器，并将初始路径设置为该 PDF 所在的目录
 									if let Some(new_path) = rfd::FileDialog::new()
 										.add_filter("PDF files", &["pdf", "PDF"])
-											.set_directory(folder) // 关键点：设置起始目录
-											.pick_file() 
+										.set_directory(folder)
+										.pick_file()
 									{
 										to_open = Some(new_path);
 									}
@@ -2059,12 +2194,10 @@ impl PdfApp {
 									let folder = path.parent().unwrap_or(std::path::Path::new("."));
 
 									#[cfg(target_os = "linux")]
-									spawn_and_reap(Command::new("xdg-open") .arg(folder) .spawn());
-									//std::process::Command::new("xdg-open").arg(folder).spawn().ok();
+									spawn_and_reap(Command::new("xdg-open").arg(folder).spawn());
 
 									#[cfg(target_os = "windows")]
 									spawn_and_reap(Command::new("explorer").arg(folder).spawn());
-									//std::process::Command::new("explorer").arg(folder).spawn().ok();
 
 									ui.close_kind(egui::UiKind::Menu);
 								}
@@ -2085,73 +2218,102 @@ impl PdfApp {
 				if let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
 					if !self.config.favorite_files.contains(&path) {
 						self.config.favorite_files.push(path);
-						self.save_all_config(); // 封装的保存方法
+						self.save_all_config();
 					}
 				}
 			}
+		});
 
-			ui.add_space(50.0);
+		if let Some(path) = to_open {
+			self.load_pdf_path(path);
+		}
+
+		if let Some(idx) = file_to_remove {
+			self.config.favorite_files.remove(idx);
+			self.save_all_config();
+		}
+
+		if let Some((idx, dir)) = move_file {
+			match dir {
+				-2 => {
+					let item = self.config.favorite_files.remove(idx);
+					self.config.favorite_files.insert(0, item);
+				}
+				2 => {
+					let item = self.config.favorite_files.remove(idx);
+					self.config.favorite_files.push(item);
+				}
+				-1 => self.config.favorite_files.swap(idx, idx - 1),
+				1 => self.config.favorite_files.swap(idx, idx + 1),
+				_ => {}
+			}
+			self.save_all_config();
+		}
+	}
+
+	fn render_quick_access_folders(&mut self, ui: &mut egui::Ui) {
+		if !self.config.show_quick_access_folders {
+			return;
+		}
+
+		let mut to_open: Option<PathBuf> = None;
+		let mut folder_to_remove: Option<usize> = None;
+		let mut move_folder: Option<(usize, isize)> = None;
+
+		ui.vertical_centered(|ui| {
 			ui.heading("Quick Access Folders");
 			ui.add_space(20.0);
 
 			egui::ScrollArea::vertical()
-				.max_height(150.0) // 固定目录区高度
-				.id_salt("folder_scroll") // 必须有独立的 ID
-				.auto_shrink([false, true]) 
+				.max_height(150.0)
+				.id_salt("folder_scroll")
+				.auto_shrink([false, true])
 				.show(ui, |ui| {
 					ui.vertical_centered(|ui| {
 						let total_folders = self.config.favorite_folders.len();
 						for (idx, path) in self.config.favorite_folders.iter().enumerate() {
-								let label = format!("📁 {}", path.display());
-								let response = ui.button(label);
+							let label = format!("📁 {}", path.display());
+							let response = ui.button(label);
 
-								if response.clicked() {
-									if let Some(new_path) = rfd::FileDialog::new()
-										.add_filter("PDF", &["pdf", "PDF"])
-											.set_directory(path)
-											.pick_file() 
-									{
-										to_open = Some(new_path);
+							if response.clicked() {
+								if let Some(new_path) = rfd::FileDialog::new()
+									.add_filter("PDF", &["pdf", "PDF"])
+									.set_directory(path)
+									.pick_file()
+								{
+									to_open = Some(new_path);
+								}
+							}
+
+							response.context_menu(|ui| {
+								if idx > 0 {
+									if ui.button("⏫Move to Top").clicked() {
+										move_folder = Some((idx, -2));
+										ui.close_kind(egui::UiKind::Menu);
+									}
+									if ui.button("⬆ Move Up").clicked() {
+										move_folder = Some((idx, -1));
+										ui.close_kind(egui::UiKind::Menu);
+									}
+								}
+								if idx < total_folders - 1 {
+									if ui.button("⬇ Move Down").clicked() {
+										move_folder = Some((idx, 1));
+										ui.close_kind(egui::UiKind::Menu);
+									}
+									if ui.button("⏬Move to Bottom").clicked() {
+										move_folder = Some((idx, 2));
+										ui.close_kind(egui::UiKind::Menu);
 									}
 								}
 
-								response.context_menu(|ui| {
-									//if idx > 0 && ui.button("⬆ Move Up").clicked() {
-									//	move_folder = Some((idx, -1));
-									//	ui.close_kind(egui::UiKind::Menu);
-									//}
-									//if idx < self.config.favorite_folders.len() - 1 && ui.button("⬇ Move Down").clicked() {
-									//	move_folder = Some((idx, 1));
-									//	ui.close_kind(egui::UiKind::Menu);
-									//}
-									if idx > 0 {
-										if ui.button("⏫Move to Top").clicked() {
-											move_folder = Some((idx, -2));
-											ui.close_kind(egui::UiKind::Menu);
-										}
-										if ui.button("⬆ Move Up").clicked() {
-											move_folder = Some((idx, -1));
-											ui.close_kind(egui::UiKind::Menu);
-										}
-									}
-									if idx < total_folders - 1 {
-										if ui.button("⬇ Move Down").clicked() {
-											move_folder = Some((idx, 1));
-											ui.close_kind(egui::UiKind::Menu);
-										}
-										if ui.button("⏬Move to Bottom").clicked() {
-											move_folder = Some((idx, 2));
-											ui.close_kind(egui::UiKind::Menu);
-										}
-									}
-
-									ui.separator();
-									if ui.button("🗑 Remove Folder").clicked() {
-										folder_to_remove = Some(idx);
-										ui.close_kind(egui::UiKind::Menu);
-									}
-								});
-								ui.add_space(4.0);
+								ui.separator();
+								if ui.button("🗑 Remove Folder").clicked() {
+									folder_to_remove = Some(idx);
+									ui.close_kind(egui::UiKind::Menu);
+								}
+							});
+							ui.add_space(4.0);
 						}
 					});
 				});
@@ -2165,60 +2327,33 @@ impl PdfApp {
 					}
 				}
 			}
-
 		});
 
 		if let Some(path) = to_open {
 			self.load_pdf_path(path);
 		}
 
-		// 处理文件操作
-        if let Some(idx) = file_to_remove {
-            self.config.favorite_files.remove(idx);
-            self.save_all_config();
-        }
-        if let Some((idx, dir)) = move_file {
-            //let target = if dir == -1 { idx - 1 } else { idx + 1 };
-            //self.config.favorite_files.swap(idx, target);
-					match dir {
-						-2 => { // 置顶：移到索引 0
-							let item = self.config.favorite_files.remove(idx);
-							self.config.favorite_files.insert(0, item);
-						}
-						2 => { // 置底：移到最后
-							let item = self.config.favorite_files.remove(idx);
-							self.config.favorite_files.push(item);
-						}
-						-1 => self.config.favorite_files.swap(idx, idx - 1), // 正常上移
-						1 => self.config.favorite_files.swap(idx, idx + 1),  // 正常下移
-						_ => {}
-						}
-            self.save_all_config();
-        }
+		if let Some(idx) = folder_to_remove {
+			self.config.favorite_folders.remove(idx);
+			self.save_all_config();
+		}
 
-        // 处理文件夹操作
-        if let Some(idx) = folder_to_remove {
-            self.config.favorite_folders.remove(idx);
-            self.save_all_config();
-        }
-        if let Some((idx, dir)) = move_folder {
-            //let target = if dir == -1 { idx - 1 } else { idx + 1 };
-            //self.config.favorite_folders.swap(idx, target);
-					match dir {
-						-2 => { // 置顶
-							let item = self.config.favorite_folders.remove(idx);
-							self.config.favorite_folders.insert(0, item);
-						}
-						2 => { // 置底
-							let item = self.config.favorite_folders.remove(idx);
-							self.config.favorite_folders.push(item);
-						}
-						-1 => self.config.favorite_folders.swap(idx, idx - 1),
-						1 => self.config.favorite_folders.swap(idx, idx + 1),
-						_ => {}
-						}
-            self.save_all_config();
-        }
+		if let Some((idx, dir)) = move_folder {
+			match dir {
+				-2 => {
+					let item = self.config.favorite_folders.remove(idx);
+					self.config.favorite_folders.insert(0, item);
+				}
+				2 => {
+					let item = self.config.favorite_folders.remove(idx);
+					self.config.favorite_folders.push(item);
+				}
+				-1 => self.config.favorite_folders.swap(idx, idx - 1),
+				1 => self.config.favorite_folders.swap(idx, idx + 1),
+				_ => {}
+			}
+			self.save_all_config();
+		}
 	}
 }
 // 统一保存
@@ -2263,7 +2398,12 @@ impl PdfApp {
 					// 当加载新 PDF 时，清空之前的擦除记录
 					self.annotations.clear();
 					self.current_pen_stroke.clear();
-					self.current_eraser_stroke.clear();
+					//self.current_eraser_stroke.clear();
+					self.current_smear_stroke.clear();
+					//// 每次打开新 PDF 时，默认切回本地 GLM-OCR
+					//self.reset_ocr_to_default_glm();
+					// 每次新打开 PDF 时，按配置中的默认 OCR 模型切换
+					self.reset_ocr_to_default_model();
 
 					//// 记忆新文件的文件夹
 					//if let Some(parent) = path.parent() {
@@ -2792,6 +2932,8 @@ impl eframe::App for PdfApp {
 
 					ui.add_space(50.0);
 					self.render_favorites(ui);
+					ui.add_space(50.0);
+					self.render_quick_access_folders(ui);
 				});
 			}
 		});
@@ -2938,7 +3080,7 @@ fn main() -> eframe::Result<()> {
                 ));
             }
 
-						cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+						//cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
             setup_fonts(&cc.egui_ctx);
 
             // Pass rx receiver into PdfApp
